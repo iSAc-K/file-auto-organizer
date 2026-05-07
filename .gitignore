@@ -1,0 +1,37 @@
+# Runtime logs and local output
+rename_log.csv
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Archives and customer/business files
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# Temporary test/input folders
+test_*/
+tmp_*/
+temp_*/
+待整理*/
+客户文件*/
+业务文件*/
+临时*/
+
+# Local environment
+.tools/
+.venv/
+venv/
+env/
+.env
+
+# OS/editor files
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,74 @@
+categories:
+  钥匙扣:
+    keywords:
+      - 雕刻钥匙扣
+      - 旋转钥匙扣
+      - 开瓶器钥匙扣
+      - 照片钥匙扣
+      - keychain
+      - key chain
+      - 钥匙扣
+    merge_enabled: true
+
+  项链:
+    keywords:
+      - 项链
+      - 吊坠
+      - necklace
+      - pendant
+    merge_enabled: true
+
+  戒指:
+    keywords:
+      - 戒指
+      - ring
+    merge_enabled: false
+
+do_not_merge_keywords:
+  - 样品
+  - 返工
+  - 异常
+  - 测试
+  - 补发
+  - 急单
+
+naming:
+  single_template: "{seq}-{date}-{category}-{orders}单-{quantity}个"
+  merged_template: "{seq_range}-{date}-{category}-{orders}单-{quantity}个"
+  custom_text: ""
+  merge_name: ""
+
+inner_folder_naming:
+  template: "{seq}-{original_name}"
+
+sequence:
+  enabled: true
+  scope: all_extracted_folders
+  sort_by: name
+  merged_range_style: min_max
+  priority_keywords:
+    - 雕刻钥匙扣
+    - 旋转钥匙扣
+    - 项链
+    - 戒指
+  include_keywords: []
+  exclude_keywords:
+    - 样品
+    - 测试
+    - 返工
+
+conflict:
+  target_exists: skip
+
+already_processed:
+  enabled: true
+  action: skip
+  patterns:
+    - '^\d+-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$'
+    - '^\d+~\d+-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$'
+
+fallback:
+  unknown_date: "未知日期"
+  unknown_category: "未知产品"
+  default_orders_per_folder: 1
+  default_quantity_per_order: 1
