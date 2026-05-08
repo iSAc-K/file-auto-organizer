@@ -1,11 +1,21 @@
 # Runtime logs and local output
 rename_log.csv
+organizer_run_log.json
+organizer_run_log.json.tmp
+launcher_settings.json
 *.log
+*.tmp
 
 # Python cache
 __pycache__/
+*.pyc
 *.py[cod]
 *.pyo
+
+# Build output
+build/
+dist/
+*.spec
 
 # Archives and customer/business files
 *.zip

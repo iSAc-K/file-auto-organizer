@@ -1,40 +1,125 @@
+category_priority:
+  - 军牌钥匙扣
+  - 军牌项链
+  - 钢片军牌钥匙扣
+  - 小钢片
+  - 刀叉
+  - 纯木名片架
+  - 方黑名片架
+  - 雕刻手链
+  - NP图片项链
+  - 翅膀图片项链
+  - 双面钥匙扣
+  - 旋转钥匙扣
+  - 心形刻字钥匙扣
+  - MA88钥匙扣
+  - 四图钥匙扣
+  - 热转印骨灰项链
+
 categories:
-  钥匙扣:
+  军牌钥匙扣:
     keywords:
-      - 雕刻钥匙扣
+      - 军牌钥匙扣
+    merge_enabled: true
+
+  军牌项链:
+    keywords:
+      - 军牌项链
+    merge_enabled: true
+
+  钢片军牌钥匙扣:
+    keywords:
+      - 钢片军牌钥匙扣
+    merge_enabled: true
+
+  小钢片:
+    keywords:
+      - 小钢片
+    merge_enabled: true
+
+  刀叉:
+    keywords:
+      - 刀叉
+      - 刀铲
+    merge_enabled: true
+
+  纯木名片架:
+    keywords:
+      - 纯木名片架
+    merge_enabled: true
+
+  方黑名片架:
+    keywords:
+      - 方黑名片架
+    merge_enabled: true
+
+  雕刻手链:
+    keywords:
+      - 雕刻手链
+    merge_enabled: true
+
+  NP图片项链:
+    keywords:
+      - NP图片项链
+      - 诺派旋转图片项链
+    merge_enabled: true
+
+  翅膀图片项链:
+    keywords:
+      - 银翅膀图片项链
+      - 金翅膀图片项链
+      - 翅膀项链
+      - 翅膀图片项链
+    merge_enabled: true
+
+  双面钥匙扣:
+    keywords:
+      - 双图热转钥匙扣
+      - 双面爱心钥匙扣
+      - 双面圆形钥匙扣
+      - 双面心形钥匙扣
+      - 双图钥匙扣
+      - 圆形钥匙扣
+      - 心形钥匙扣
+    merge_enabled: true
+
+  旋转钥匙扣:
+    keywords:
       - 旋转钥匙扣
-      - 开瓶器钥匙扣
-      - 照片钥匙扣
-      - keychain
-      - key chain
-      - 钥匙扣
     merge_enabled: true
 
-  项链:
+  心形刻字钥匙扣:
     keywords:
-      - 项链
-      - 吊坠
-      - necklace
-      - pendant
+      - 心形刻字钥匙扣
     merge_enabled: true
 
-  戒指:
+  MA88钥匙扣:
     keywords:
-      - 戒指
-      - ring
-    merge_enabled: false
+      - MA88钥匙扣
+    merge_enabled: true
+
+  四图钥匙扣:
+    keywords:
+      - 四图钥匙扣
+      - 诺派四图钥匙扣
+      - 四图诺派钥匙扣
+    merge_enabled: true
+
+  热转印骨灰项链:
+    keywords:
+      - 骨灰项链
+    merge_enabled: true
 
 do_not_merge_keywords:
   - 样品
+  - 测试
   - 返工
   - 异常
-  - 测试
-  - 补发
-  - 急单
 
 naming:
-  single_template: "{seq}-{date}-{category}-{orders}单-{quantity}个"
-  merged_template: "{seq_range}-{date}-{category}-{orders}单-{quantity}个"
+  single_keep_original: true
+  single_template: "{seq}-{clean_original_name}"
+  merged_template: "{seq_range}-{category}-{orders}单-{quantity}个"
   custom_text: ""
   merge_name: ""
 
@@ -46,16 +131,12 @@ sequence:
   scope: all_extracted_folders
   sort_by: name
   merged_range_style: min_max
-  priority_keywords:
-    - 雕刻钥匙扣
-    - 旋转钥匙扣
-    - 项链
-    - 戒指
+  priority_keywords: []
   include_keywords: []
-  exclude_keywords:
-    - 样品
-    - 测试
-    - 返工
+  exclude_keywords: []
+
+quantity_detection:
+  source: outer_folder_name_only
 
 conflict:
   target_exists: skip
@@ -64,8 +145,8 @@ already_processed:
   enabled: true
   action: skip
   patterns:
-    - '^\d+-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$'
     - '^\d+~\d+-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$'
+    - '^\d+~\d+-.+-\d+单-\d+个$'
 
 fallback:
   unknown_date: "未知日期"

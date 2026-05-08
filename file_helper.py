@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import json
 import os
 import re
 import shutil
@@ -28,9 +29,19 @@ except ImportError:  # PyYAML is recommended, but the default config has a fallb
 
 
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
-SPREADSHEET_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".csv", ".tsv"}
+RUN_LOG_NAME = "organizer_run_log.json"
+RUN_LOG_TMP_NAME = "organizer_run_log.json.tmp"
+UNDOABLE_RUN_STATUSES = {"success", "partial"}
 WINDOWS_ILLEGAL_CHARS = r'\/:*?"<>|'
 SYSTEM_FOLDER_NAMES = {"__pycache__", ".git", ".hg", ".svn", ".venv", "venv", "env"}
+QUANTITY_SOURCE_LABELS = {
+    "outer_folder_name_only": "outer_folder_name_only",
+    "fallback": "fallback",
+}
+GENERATED_MERGE_FOLDER_PATTERNS = [
+    re.compile(r"^\d+(?:[~～-]\d+|\+\d+(?:\+\d+)*)-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$"),
+    re.compile(r"^\d+(?:[~～]\d+|-\d{1,3}|\+\d+(?:\+\d+)*)-.+-\d+单-\d+个$"),
+]
 LOG_FIELDS = [
     "time",
     "mode",
@@ -51,11 +62,13 @@ LOG_FIELDS = [
 ]
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    "category_priority": [],
     "categories": {},
     "do_not_merge_keywords": [],
     "naming": {
-        "single_template": "{seq}-{date}-{category}-{orders}单-{quantity}个",
-        "merged_template": "{seq_range}-{date}-{category}-{orders}单-{quantity}个",
+        "single_keep_original": True,
+        "single_template": "{seq}-{clean_original_name}",
+        "merged_template": "{seq_range}-{category}-{orders}单-{quantity}个",
         "custom_text": "",
         "merge_name": "",
     },
@@ -69,13 +82,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "include_keywords": [],
         "exclude_keywords": [],
     },
+    "quantity_detection": {
+        "source": "outer_folder_name_only",
+    },
     "conflict": {"target_exists": "skip"},
     "already_processed": {
         "enabled": True,
         "action": "skip",
         "patterns": [
-            r"^\d+-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$",
             r"^\d+~\d+-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$",
+            r"^\d+~\d+-.+-\d+单-\d+个$",
         ],
     },
     "fallback": {
@@ -108,10 +124,13 @@ class Detection:
     merge_enabled: bool = False
     orders: int = 0
     quantity: int = 0
+    quantity_source_label: str = ""
     quantity_sources: List[str] = field(default_factory=list)
+    ignored_quantity_sources: List[str] = field(default_factory=list)
     date_sources: List[str] = field(default_factory=list)
     category_sources: List[str] = field(default_factory=list)
     do_not_merge_hits: List[str] = field(default_factory=list)
+    category_priority_index: Optional[int] = None
 
 
 @dataclass
@@ -128,6 +147,8 @@ class WorkItem:
     modified_time: float = 0
     scan_entries: List[ScanEntry] = field(default_factory=list)
     sequence_number: Optional[int] = None
+    clean_original_name: str = ""
+    removed_windows_duplicate_suffix: bool = False
     skip_reason: str = ""
     detection: Detection = field(default_factory=Detection)
     final_path: Optional[Path] = None
@@ -152,6 +173,14 @@ class PlanGroup:
 
 def now_text() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def run_id_text() -> str:
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def absolute_text(path: Path) -> str:
+    return str(path.expanduser().resolve())
 
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -235,7 +264,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     if not config_path.exists():
         print(f"提示：找不到配置文件，使用内置默认配置：{config_path}")
         return dict(DEFAULT_CONFIG)
-    text = config_path.read_text(encoding="utf-8")
+    text = config_path.read_text(encoding="utf-8").lstrip("\ufeff")
     try:
         loaded = simple_yaml_load(text) if yaml is None else (yaml.safe_load(text) or {})
     except Exception as exc:
@@ -260,6 +289,8 @@ def validate_template(name: str, template: str, allowed: Iterable[str]) -> None:
 
 
 def validate_config(config: Dict[str, Any]) -> None:
+    if not isinstance(config.get("category_priority", []), list):
+        raise ConfigError("category_priority 必须是列表。")
     if not isinstance(config.get("categories"), dict):
         raise ConfigError("categories 必须是字典。")
     for category, data in config["categories"].items():
@@ -277,6 +308,12 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ConfigError("sequence.merged_range_style 只支持 min_max 或 list。")
     if config.get("conflict", {}).get("target_exists") != "skip":
         raise ConfigError("第一版 conflict.target_exists 只支持 skip。")
+    quantity_detection = config.get("quantity_detection", {})
+    if not isinstance(quantity_detection, dict):
+        raise ConfigError("quantity_detection 必须是字典。")
+    source = quantity_detection.get("source", "outer_folder_name_only")
+    if source != "outer_folder_name_only":
+        raise ConfigError("quantity_detection.source 只支持 outer_folder_name_only。")
 
     naming_allowed = {
         "seq",
@@ -286,10 +323,11 @@ def validate_config(config: Dict[str, Any]) -> None:
         "orders",
         "quantity",
         "original_name",
+        "clean_original_name",
         "custom_text",
         "merge_name",
     }
-    inner_allowed = {"seq", "original_name", "category", "date", "orders", "quantity"}
+    inner_allowed = {"seq", "original_name", "clean_original_name", "category", "date", "orders", "quantity"}
     validate_template("naming.single_template", config["naming"]["single_template"], naming_allowed)
     validate_template("naming.merged_template", config["naming"]["merged_template"], naming_allowed)
     validate_template("inner_folder_naming.template", config["inner_folder_naming"]["template"], inner_allowed)
@@ -303,6 +341,83 @@ def write_log(log_path: Path, row: Dict[str, Any]) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow({field: row.get(field, "") for field in LOG_FIELDS})
+
+
+def load_run_log(run_log_path: Path) -> Dict[str, Any]:
+    if not run_log_path.exists():
+        return {"runs": []}
+    with run_log_path.open("r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("organizer_run_log.json 顶层必须是对象。")
+    runs = data.get("runs", [])
+    if not isinstance(runs, list):
+        raise ValueError("organizer_run_log.json 中 runs 必须是列表。")
+    data["runs"] = runs
+    return data
+
+
+def safe_write_run_log(run_log_path: Path, data: Dict[str, Any]) -> None:
+    run_log_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = run_log_path.with_name(RUN_LOG_TMP_NAME)
+    with tmp_path.open("w", encoding="utf-8", newline="\n") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, run_log_path)
+
+
+def create_apply_run(root: Path, run_log_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    data = load_run_log(run_log_path)
+    run = {
+        "run_id": run_id_text(),
+        "root": absolute_text(root),
+        "time": now_text(),
+        "status": "running",
+        "undone": False,
+        "undo_time": "",
+        "undo_status": "",
+        "operations": [],
+    }
+    data["runs"].append(run)
+    safe_write_run_log(run_log_path, data)
+    return data, run
+
+
+def append_run_operation(
+    run_log_path: Path,
+    data: Dict[str, Any],
+    run: Dict[str, Any],
+    operation: Dict[str, Any],
+) -> None:
+    run.setdefault("operations", []).append(operation)
+    safe_write_run_log(run_log_path, data)
+
+
+def update_run_status(run_log_path: Path, data: Dict[str, Any], run: Dict[str, Any], status: str) -> None:
+    run["status"] = status
+    safe_write_run_log(run_log_path, data)
+
+
+def update_run_undo_status(
+    run_log_path: Path,
+    data: Dict[str, Any],
+    run: Dict[str, Any],
+    undone: bool,
+    undo_status: str,
+) -> None:
+    run["undone"] = undone
+    run["undo_time"] = now_text()
+    run["undo_status"] = undo_status
+    safe_write_run_log(run_log_path, data)
+
+
+def make_operation(action: str, source_before: Optional[Path] = None, target_after: Optional[Path] = None) -> Dict[str, Any]:
+    operation: Dict[str, Any] = {"action": action}
+    if source_before is not None:
+        operation["source_before"] = absolute_text(source_before)
+    if target_after is not None:
+        operation["target_after"] = absolute_text(target_after)
+    return operation
 
 
 def log_item(
@@ -338,6 +453,67 @@ def log_item(
             "error_message": error_message,
         },
     )
+
+
+def log_undo(
+    log_path: Path,
+    action: str,
+    status: str = "success",
+    error_message: str = "",
+    source_path: Optional[Path] = None,
+    target_path: Optional[Path] = None,
+) -> None:
+    write_log(
+        log_path,
+        {
+            "time": now_text(),
+            "mode": "undo-last",
+            "action": action,
+            "source_path": str(source_path or ""),
+            "target_path": str(target_path or ""),
+            "status": status,
+            "error_message": error_message,
+        },
+    )
+
+
+def log_confirmation(log_path: Path, mode: str, method: str) -> None:
+    write_log(
+        log_path,
+        {
+            "time": now_text(),
+            "mode": mode,
+            "action": "confirm",
+            "status": "success",
+            "error_message": f"confirmation_method={method}",
+        },
+    )
+
+
+def zip_path_for_folder(folder: Path) -> Path:
+    return folder.parent / f"{folder.name}.zip"
+
+
+def log_group_zip(
+    log_path: Path,
+    mode: str,
+    action: str,
+    group: PlanGroup,
+    status: str = "success",
+    error_message: str = "",
+) -> None:
+    for item in group.items:
+        log_item(
+            log_path,
+            mode,
+            action,
+            item,
+            group=group,
+            status=status,
+            error_message=error_message,
+            source_path=group.target_path,
+            target_path=zip_path_for_folder(group.target_path),
+        )
 
 
 def find_executable(names: Sequence[str], extra_paths: Sequence[Path]) -> Optional[Path]:
@@ -423,6 +599,10 @@ def is_already_processed(name: str, config: Dict[str, Any]) -> bool:
     return False
 
 
+def is_generated_merge_folder_name(name: str) -> bool:
+    return any(pattern.match(name) for pattern in GENERATED_MERGE_FOLDER_PATTERNS)
+
+
 def list_root_archives(root: Path) -> List[Path]:
     return sorted(
         [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in ARCHIVE_EXTENSIONS],
@@ -444,7 +624,9 @@ def existing_root_folders(root: Path, config: Dict[str, Any]) -> List[WorkItem]:
             created_time=stat.st_ctime,
             modified_time=stat.st_mtime,
         )
-        if is_already_processed(path.name, config):
+        if is_generated_merge_folder_name(path.name):
+            item.skip_reason = "识别为已生成的合并目标目录，跳过，避免作为来源重复统计。"
+        elif is_already_processed(path.name, config):
             item.skip_reason = "可能已经整理过，默认跳过。"
         items.append(item)
     return items
@@ -484,8 +666,7 @@ def folder_entries_to_scan(folder: Path) -> List[ScanEntry]:
 
 
 def combined_text(item: WorkItem) -> str:
-    names = [item.original_name] + [entry.name for entry in item.scan_entries] + [entry.rel_path for entry in item.scan_entries]
-    return " ".join(names).casefold()
+    return item.original_name.casefold()
 
 
 def keyword_hit(text: str, keywords: Sequence[str]) -> bool:
@@ -501,13 +682,50 @@ def priority_index(text: str, keywords: Sequence[str]) -> int:
     return len(keywords) + 1
 
 
+def clean_windows_duplicate_suffix(name: str) -> Tuple[str, bool]:
+    cleaned = re.sub(r"\(\d+\)$", "", name).rstrip()
+    return cleaned or name, cleaned != name
+
+
+def category_priority_index(category: str, config: Dict[str, Any]) -> Optional[int]:
+    for idx, configured in enumerate(config.get("category_priority", []) or []):
+        if str(configured) == category:
+            return idx
+    return None
+
+
+def secondary_sequence_key(item: WorkItem, config: Dict[str, Any]) -> Tuple[Any, ...]:
+    seq = config.get("sequence", {})
+    sort_by = seq.get("sort_by", "name")
+    name_key = item.original_name.casefold()
+    if sort_by == "created_time":
+        return (item.created_time, name_key)
+    if sort_by == "modified_time":
+        return (item.modified_time, name_key)
+    if sort_by == "custom_priority":
+        priorities = seq.get("priority_keywords", []) or []
+        return (priority_index(combined_text(item), priorities), name_key)
+    return (name_key,)
+
+
+def category_sequence_key(item: WorkItem, config: Dict[str, Any]) -> Tuple[Any, ...]:
+    unknown = config["fallback"]["unknown_category"]
+    priority = item.detection.category_priority_index
+    if priority is not None:
+        category_rank = (0, priority)
+    elif item.detection.category == unknown:
+        category_rank = (2, item.detection.category.casefold())
+    else:
+        category_rank = (1, item.detection.category.casefold())
+    return (*category_rank, *secondary_sequence_key(item, config))
+
+
 def assign_sequence_numbers(items: List[WorkItem], config: Dict[str, Any]) -> None:
     seq = config.get("sequence", {})
     if not seq.get("enabled", True):
         return
     candidates: List[WorkItem] = []
     include_keywords = seq.get("include_keywords", []) or []
-    exclude_keywords = seq.get("exclude_keywords", []) or []
     for item in items:
         if item.skip_reason:
             continue
@@ -515,21 +733,8 @@ def assign_sequence_numbers(items: List[WorkItem], config: Dict[str, Any]) -> No
         if include_keywords and not keyword_hit(text, include_keywords):
             item.skip_reason = "未命中 sequence.include_keywords，不参与序号。"
             continue
-        if exclude_keywords and keyword_hit(text, exclude_keywords):
-            item.skip_reason = "命中 sequence.exclude_keywords，不参与序号。"
-            continue
         candidates.append(item)
-    sort_by = seq.get("sort_by", "name")
-    if sort_by == "created_time":
-        key = lambda it: (it.created_time, it.original_name.casefold())
-    elif sort_by == "modified_time":
-        key = lambda it: (it.modified_time, it.original_name.casefold())
-    elif sort_by == "custom_priority":
-        priorities = seq.get("priority_keywords", []) or []
-        key = lambda it: (priority_index(combined_text(it), priorities), it.original_name.casefold())
-    else:
-        key = lambda it: it.original_name.casefold()
-    for idx, item in enumerate(sorted(candidates, key=key), start=1):
+    for idx, item in enumerate(sorted(candidates, key=lambda it: category_sequence_key(it, config)), start=1):
         item.sequence_number = idx
 
 
@@ -539,22 +744,21 @@ def normalize_date(month: int, day: int) -> Optional[str]:
     return None
 
 
-def detect_dates(entries: List[ScanEntry], original_name: str, unknown: str) -> Tuple[List[str], str, List[str]]:
+def detect_dates(original_name: str, unknown: str) -> Tuple[List[str], str, List[str]]:
     sources: List[str] = []
     found: List[str] = []
-    texts = [(entry.name, entry.rel_path) for entry in entries] + [(original_name, "外层名称")]
+    search_text = re.sub(r"^\d{1,3}\s*[-_]\s*", "", original_name, count=1)
     patterns = [
         re.compile(r"(?<!\d)(?:20\d{2})[-.]?(0[1-9]|1[0-2])[-.]?([0-2]\d|3[01])(?!\d)"),
         re.compile(r"(?<!\d)(0?[1-9]|1[0-2])[-.](0?[1-9]|[12]\d|3[01])(?!\d)"),
         re.compile(r"(?<!\d)(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)"),
     ]
-    for text, source in texts:
-        for pattern in patterns:
-            for match in pattern.finditer(text):
-                date_text = normalize_date(int(match.group(1)), int(match.group(2)))
-                if date_text:
-                    found.append(date_text)
-                    sources.append(source)
+    for pattern in patterns:
+        for match in pattern.finditer(search_text):
+            date_text = normalize_date(int(match.group(1)), int(match.group(2)))
+            if date_text:
+                found.append(date_text)
+                sources.append("outer_folder_name_only")
     unique = sorted(set(found), key=lambda d: (int(d[:2]), int(d[2:])))
     if not unique:
         return [], unknown, []
@@ -563,79 +767,62 @@ def detect_dates(entries: List[ScanEntry], original_name: str, unknown: str) -> 
     return unique, f"{unique[0]}-{unique[-1]}", sources
 
 
-def detect_category(entries: List[ScanEntry], original_name: str, config: Dict[str, Any]) -> Tuple[str, str, bool, List[str]]:
+def detect_category(original_name: str, config: Dict[str, Any]) -> Tuple[str, str, bool, List[str]]:
     best: Tuple[int, str, str, bool, str] = (0, "", "", False, "")
-    texts = [(entry.name, entry.rel_path) for entry in entries] + [(original_name, "外层名称")]
     for category, data in config.get("categories", {}).items():
         for keyword in data.get("keywords", []) or []:
             kw = str(keyword)
-            for text, source in texts:
-                if kw.casefold() in text.casefold() and len(kw) > best[0]:
-                    best = (len(kw), category, kw, bool(data.get("merge_enabled", False)), source)
+            if kw.casefold() in original_name.casefold() and len(kw) > best[0]:
+                best = (len(kw), category, kw, bool(data.get("merge_enabled", False)), "outer_folder_name_only")
     if best[1]:
         return best[1], best[2], best[3], [best[4]]
     return config["fallback"]["unknown_category"], "", False, []
 
 
-def entry_priority(entry: ScanEntry) -> int:
-    if not entry.is_dir and entry.suffix in SPREADSHEET_EXTENSIONS:
-        return 1
-    if entry.is_dir:
-        return 2
-    return 3
+def detect_orders_quantity(
+    original_name: str,
+    config: Dict[str, Any],
+) -> Tuple[int, int, str, List[str], List[str]]:
+    pattern = re.compile(r"(\d+)\s*(?:单|订单)\s*[-_,，\s]*\s*(\d+)\s*(?:个|件)")
+    match = pattern.search(original_name)
+    if match:
+        orders = int(match.group(1))
+        quantity = int(match.group(2))
+        return orders, quantity, QUANTITY_SOURCE_LABELS["outer_folder_name_only"], [], []
 
-
-def detect_orders_quantity(entries: List[ScanEntry], config: Dict[str, Any]) -> Tuple[int, int, List[str]]:
-    pattern = re.compile(
-        r"(\d+)\s*(?:订单|单|orders?|order)\s*[-,，、\s]*\s*(\d+)\s*(?:个|件|pcs?|pieces?)",
-        re.IGNORECASE,
-    )
-    matches: List[Tuple[int, int, int, str]] = []
-    seen = set()
-    for entry in entries:
-        match = pattern.search(entry.name)
-        if not match or entry.rel_path in seen:
-            continue
-        seen.add(entry.rel_path)
-        matches.append((entry_priority(entry), int(match.group(1)), int(match.group(2)), entry.rel_path))
-    if matches:
-        best = min(match[0] for match in matches)
-        selected = [match for match in matches if match[0] == best]
-        return sum(match[1] for match in selected), sum(match[2] for match in selected), [match[3] for match in selected]
-    immediate_dirs = {
-        entry.rel_path.replace("\\", "/").split("/")[0]
-        for entry in entries
-        if entry.is_dir and len(entry.rel_path.replace("\\", "/").split("/")) == 1
-    }
     default_orders = int(config["fallback"].get("default_orders_per_folder", 1))
     default_qty = int(config["fallback"].get("default_quantity_per_order", 1))
-    orders = max(len(immediate_dirs), default_orders)
+    orders = max(default_orders, 1)
     quantity = max(orders * default_qty, 1)
-    return orders, quantity, ["未识别到数量，使用 fallback 规则"]
+    return orders, quantity, QUANTITY_SOURCE_LABELS["fallback"], ["外层文件夹名未识别到数量，使用 fallback"], []
 
 
-def detect_do_not_merge(entries: List[ScanEntry], original_name: str, config: Dict[str, Any]) -> List[str]:
-    text = " ".join([original_name] + [entry.name for entry in entries] + [entry.rel_path for entry in entries]).casefold()
+def detect_do_not_merge(original_name: str, config: Dict[str, Any]) -> List[str]:
+    text = original_name.casefold()
     return [str(keyword) for keyword in config.get("do_not_merge_keywords", []) or [] if str(keyword).casefold() in text]
 
 
 def scan_and_detect(item: WorkItem, config: Dict[str, Any]) -> None:
-    item.scan_entries = archive_entries_to_scan(item.archive_entries, item.original_name) if item.source_type == "archive" else folder_entries_to_scan(item.current_path)
+    item.scan_entries = []
+    item.clean_original_name, item.removed_windows_duplicate_suffix = clean_windows_duplicate_suffix(item.original_name)
     detection = Detection()
-    dates, label, date_sources = detect_dates(item.scan_entries, item.original_name, config["fallback"]["unknown_date"])
+    dates, label, date_sources = detect_dates(item.original_name, config["fallback"]["unknown_date"])
     detection.dates = dates
     detection.date_label = label
     detection.date_sources = date_sources
-    category, keyword, merge_enabled, category_sources = detect_category(item.scan_entries, item.original_name, config)
+    category, keyword, merge_enabled, category_sources = detect_category(item.original_name, config)
     detection.category = category
     detection.matched_keyword = keyword
     detection.merge_enabled = merge_enabled
     detection.category_sources = category_sources
-    orders, quantity, quantity_sources = detect_orders_quantity(item.scan_entries, config)
+    detection.category_priority_index = category_priority_index(category, config)
+    orders, quantity, quantity_source_label, quantity_sources, ignored_quantity_sources = detect_orders_quantity(item.original_name, config)
     detection.orders = orders
     detection.quantity = quantity
+    detection.quantity_source_label = quantity_source_label
     detection.quantity_sources = quantity_sources
-    detection.do_not_merge_hits = detect_do_not_merge(item.scan_entries, item.original_name, config)
+    detection.ignored_quantity_sources = ignored_quantity_sources
+    detection.do_not_merge_hits = detect_do_not_merge(item.original_name, config)
     item.detection = detection
 
 
@@ -677,6 +864,7 @@ def render_inner_folder_name(item: WorkItem, config: Dict[str, Any]) -> str:
         {
             "seq": item.sequence_number or "",
             "original_name": item.original_name,
+            "clean_original_name": item.clean_original_name or item.original_name,
             "category": item.detection.category,
             "date": item.detection.date_label,
             "orders": item.detection.orders,
@@ -703,6 +891,7 @@ def render_group(items: List[WorkItem], is_merge: bool, config: Dict[str, Any], 
             "orders": orders,
             "quantity": quantity,
             "original_name": first.original_name,
+            "clean_original_name": first.clean_original_name or first.original_name,
             "custom_text": config.get("naming", {}).get("custom_text", ""),
             "merge_name": config.get("naming", {}).get("merge_name", category),
         },
@@ -746,7 +935,7 @@ def build_merge_groups(items: List[WorkItem], config: Dict[str, Any], root: Path
     return sorted(groups, key=lambda group: min(item.sequence_number or 999999 for item in group.items))
 
 
-def build_plan(root: Path, config: Dict[str, Any], mode: str, log_path: Path) -> Tuple[List[WorkItem], List[PlanGroup]]:
+def build_plan(root: Path, config: Dict[str, Any], mode: str, log_path: Path, archive_enabled: bool = False) -> Tuple[List[WorkItem], List[PlanGroup]]:
     log_dry_run = mode == "dry-run"
     winrar = find_winrar()
     unrar = find_unrar()
@@ -810,11 +999,28 @@ def build_plan(root: Path, config: Dict[str, Any], mode: str, log_path: Path) ->
                     log_item(log_path, mode, "plan_skip", item, group=group, status="skipped", error_message="目标目录已存在，apply 会按 skip 处理。")
                 else:
                     log_item(log_path, mode, "plan_merge" if group.is_merge else "plan_rename", item, group=group)
+            if archive_enabled:
+                zip_path = zip_path_for_folder(group.target_path)
+                if group.target_path.exists() and not any(item.current_path == group.target_path for item in group.items):
+                    log_group_zip(log_path, mode, "plan_zip", group, status="skipped", error_message="整理目标目录已存在，apply 会跳过该整理项，因此不压缩。")
+                elif zip_path.exists():
+                    log_group_zip(log_path, mode, "plan_zip", group, status="skipped", error_message="同名 zip 已存在，压缩阶段会跳过。")
+                else:
+                    log_group_zip(log_path, mode, "plan_zip", group)
     return items, groups
 
 
-def print_plan(root: Path, config: Dict[str, Any], items: List[WorkItem], groups: List[PlanGroup], mode: str) -> None:
+def category_priority_label(item: WorkItem, config: Dict[str, Any]) -> str:
+    if item.detection.category_priority_index is not None:
+        return f"第 {item.detection.category_priority_index + 1} 类"
+    if item.detection.category == config["fallback"]["unknown_category"]:
+        return "未识别，排在最后"
+    return "未在 category_priority 中，排在最后"
+
+
+def print_plan(root: Path, config: Dict[str, Any], items: List[WorkItem], groups: List[PlanGroup], mode: str, archive_enabled: bool = False) -> None:
     archives = [item for item in items if item.source_type == "archive"]
+    group_by_item = {id(item): group for group in groups for item in group.items}
     print("\n========== 文件整理计划 ==========")
     print(f"模式：{mode}")
     print(f"根目录：{root}")
@@ -845,16 +1051,33 @@ def print_plan(root: Path, config: Dict[str, Any], items: List[WorkItem], groups
     print("\n识别结果：")
     for item in sorted(assigned, key=lambda it: it.sequence_number or 999999):
         det = item.detection
+        group = group_by_item.get(id(item))
+        if group and group.is_merge:
+            merge_decision = f"有同品类文件夹，合并为：{group.final_name}"
+        elif group:
+            merge_decision = "不合并" if group.reason == "不合并" else f"{group.reason}，不合并"
+        else:
+            merge_decision = "未生成整理计划"
         print(f"[{item.sequence_number}-{item.original_name}]")
+        print(f"  外层文件夹名：{item.original_name}")
+        print("  识别来源：outer_folder_name_only")
+        print(f"  清理名称：{item.clean_original_name or item.original_name}")
+        print(f"  删除末尾括号编号：{'是' if item.removed_windows_duplicate_suffix else '否'}")
         print(f"  日期：{det.date_label}")
-        print(f"  产品：{det.category}")
+        print(f"  识别品类：{det.category}")
+        print(f"  识别数量：{det.orders}单{det.quantity}个")
         print(f"  命中关键词：{det.matched_keyword or '未命中'}")
+        print(f"  品类排序：{category_priority_label(item, config)}")
+        print(f"  分配序号：{item.sequence_number}")
         print(f"  merge_enabled: {str(det.merge_enabled).lower()}")
         if det.do_not_merge_hits:
             print(f"  强制不合并命中：{', '.join(det.do_not_merge_hits)}")
-        print(f"  单数：{det.orders}")
-        print(f"  个数：{det.quantity}")
-        print(f"  数量来源：{'; '.join(det.quantity_sources)}")
+        if det.quantity_source_label == "fallback":
+            print(f"  说明：外层文件夹名未识别到数量，使用 fallback；未扫描内层文件名和内层文件夹名")
+        else:
+            print("  说明：未扫描内层文件名和内层文件夹名")
+        print(f"  合并判断：{merge_decision}")
+        print(f"  最终名称：{group.final_name if group else '无'}")
     print("\n整理计划：")
     if not groups:
         print("- 没有可执行的合并或重命名计划")
@@ -870,10 +1093,36 @@ def print_plan(root: Path, config: Dict[str, Any], items: List[WorkItem], groups
         print(f"  使用模板：{group.naming_template}")
         print(f"  最终名称：{group.final_name}")
         if group.is_merge:
+            print(f"  合并组：{group.category}")
+            print(f"  来源数量：{len(group.items)} 个")
+            print("  来源明细：")
+            for item in group.items:
+                seq_label = item.sequence_number if item.sequence_number is not None else "未分配"
+                print(f"  - {seq_label}：{item.detection.orders}单{item.detection.quantity}个")
+            print(f"  合计：{group.orders}单{group.quantity}个")
+        if group.is_merge:
             print("  合并后内部结构计划：")
             print(f"  {group.final_name}\\")
             for item in group.items:
                 print(f"      {item.inner_name}\\")
+    print("\n压缩计划：")
+    if not archive_enabled:
+        print("- 未启用 --archive，本次不会压缩最终文件夹")
+        print("==================================\n")
+        return
+    if not groups:
+        print("- 没有需要压缩的最终文件夹")
+    for group in groups:
+        zip_path = zip_path_for_folder(group.target_path)
+        source_is_already_target = any(item.current_path == group.target_path for item in group.items)
+        if group.target_path.exists() and not source_is_already_target:
+            print(f"- 跳过压缩: {group.final_name}")
+            print("  跳过原因：整理目标目录已存在，apply 会跳过该整理项")
+        elif zip_path.exists():
+            print(f"- 跳过压缩: {group.final_name} -> {zip_path.name}")
+            print("  跳过原因：同名 zip 已存在")
+        else:
+            print(f"- 压缩: {group.final_name}\\ -> {zip_path.name}")
     print("==================================\n")
 
 
@@ -914,7 +1163,71 @@ def next_available_path(path: Path) -> Path:
     raise RuntimeError(f"无法生成不冲突的路径：{path}")
 
 
-def apply_plan(groups: List[PlanGroup], log_path: Path) -> None:
+def add_folder_to_zip(folder: Path, zip_path: Path) -> None:
+    with zipfile.ZipFile(zip_path, "x", compression=zipfile.ZIP_DEFLATED) as zf:
+        has_entries = False
+        for path in sorted(folder.rglob("*"), key=lambda p: str(p).casefold()):
+            arcname = path.relative_to(folder.parent)
+            if path.is_dir():
+                children = list(path.iterdir())
+                if not children:
+                    zf.write(path, str(arcname).replace("\\", "/") + "/")
+                    has_entries = True
+                continue
+            zf.write(path, str(arcname).replace("\\", "/"))
+            has_entries = True
+        if not has_entries:
+            zf.write(folder, f"{folder.name}/")
+
+
+def compress_groups(
+    groups: List[PlanGroup],
+    log_path: Path,
+    run_log_path: Path,
+    run_log_data: Dict[str, Any],
+    run: Dict[str, Any],
+) -> int:
+    failed_count = 0
+    print("\n开始压缩最终文件夹：")
+    if not groups:
+        print("- 没有需要压缩的最终文件夹")
+        return failed_count
+    for group in groups:
+        zip_path = zip_path_for_folder(group.target_path)
+        if not group.target_path.exists() or not group.target_path.is_dir():
+            log_group_zip(log_path, "apply", "zip", group, status="skipped", error_message="最终文件夹不存在，跳过压缩。")
+            print(f"跳过压缩：最终文件夹不存在 -> {group.target_path}")
+            continue
+        if zip_path.exists():
+            log_group_zip(log_path, "apply", "zip", group, status="skipped", error_message="同名 zip 已存在，未覆盖。")
+            print(f"跳过压缩：同名 zip 已存在 -> {zip_path}")
+            continue
+        try:
+            add_folder_to_zip(group.target_path, zip_path)
+            append_run_operation(run_log_path, run_log_data, run, make_operation("archive_create", target_after=zip_path))
+            log_group_zip(log_path, "apply", "zip", group)
+            print(f"完成压缩：{zip_path.name}")
+        except Exception as exc:
+            if zip_path.exists():
+                try:
+                    zip_path.unlink()
+                except OSError:
+                    pass
+            log_group_zip(log_path, "apply", "zip", group, status="failed", error_message=str(exc))
+            print(f"错误：{group.final_name} 压缩失败，已跳过。原因：{exc}")
+            failed_count += 1
+    return failed_count
+
+
+def apply_plan(
+    groups: List[PlanGroup],
+    log_path: Path,
+    run_log_path: Path,
+    run_log_data: Dict[str, Any],
+    run: Dict[str, Any],
+) -> Tuple[List[PlanGroup], int]:
+    completed_groups: List[PlanGroup] = []
+    failed_count = 0
     for group in groups:
         try:
             if group.target_path.exists():
@@ -927,25 +1240,201 @@ def apply_plan(groups: List[PlanGroup], log_path: Path) -> None:
                     raise RuntimeError(f"来源准备失败：{item.original_name}")
             if group.is_merge:
                 group.target_path.mkdir(parents=False, exist_ok=False)
+                append_run_operation(run_log_path, run_log_data, run, make_operation("create_dir", target_after=group.target_path))
                 for item in group.items:
                     destination = next_available_path(group.target_path / item.inner_name)
+                    source_before = item.current_path
                     shutil.move(str(item.current_path), str(destination))
-                    log_item(log_path, "apply", "move", item, group=group, source_path=item.current_path, target_path=destination)
+                    append_run_operation(run_log_path, run_log_data, run, make_operation("move", source_before=source_before, target_after=destination))
+                    log_item(log_path, "apply", "move", item, group=group, source_path=source_before, target_path=destination)
                     log_item(log_path, "apply", "merge", item, group=group, source_path=destination, target_path=group.target_path)
                 print(f"完成合并：{group.final_name}")
+                completed_groups.append(group)
             else:
                 item = group.items[0]
                 if item.current_path == group.target_path:
                     log_item(log_path, "apply", "rename", item, group=group, status="skipped", error_message="来源名称已经等于目标名称。")
                     print(f"跳过重命名：{item.current_path.name}")
+                    completed_groups.append(group)
                     continue
+                source_before = item.current_path
                 item.current_path.rename(group.target_path)
-                log_item(log_path, "apply", "rename", item, group=group, source_path=item.current_path, target_path=group.target_path)
+                append_run_operation(run_log_path, run_log_data, run, make_operation("move", source_before=source_before, target_after=group.target_path))
+                log_item(log_path, "apply", "rename", item, group=group, source_path=source_before, target_path=group.target_path)
                 print(f"完成重命名：{item.original_name} -> {group.final_name}")
+                completed_groups.append(group)
         except Exception as exc:
+            failed_count += 1
             for item in group.items:
                 log_item(log_path, "apply", "skip", item, group=group, status="failed", error_message=str(exc))
             print(f"错误：{group.final_name} 执行失败，已跳过。原因：{exc}")
+    return completed_groups, failed_count
+
+
+def find_last_undoable_run(data: Dict[str, Any], root: Path) -> Optional[Dict[str, Any]]:
+    root_text = absolute_text(root)
+    for run in reversed(data.get("runs", [])):
+        if not isinstance(run, dict):
+            continue
+        if run.get("root") != root_text:
+            continue
+        if run.get("undone") is True:
+            continue
+        if run.get("status") not in UNDOABLE_RUN_STATUSES:
+            continue
+        if not isinstance(run.get("operations"), list) or not run.get("operations"):
+            continue
+        return run
+    return None
+
+
+def print_undo_plan(run: Dict[str, Any], log_path: Path) -> None:
+    print("\n========== 撤销上次整理计划 ==========")
+    print(f"run_id：{run.get('run_id', '')}")
+    print(f"运行时间：{run.get('time', '')}")
+    print(f"原始状态：{run.get('status', '')}")
+    print(f"根目录：{run.get('root', '')}")
+    print("\n将按记录倒序处理：")
+    for operation in reversed(run.get("operations", [])):
+        action = operation.get("action", "")
+        source = Path(operation["source_before"]) if operation.get("source_before") else None
+        target = Path(operation["target_after"]) if operation.get("target_after") else None
+        if action == "move":
+            print(f"- 移回: {target} -> {source}")
+            log_undo(log_path, "plan_undo", source_path=target, target_path=source)
+        elif action == "create_dir":
+            print(f"- 删除空目录: {target}")
+            log_undo(log_path, "plan_undo", source_path=target, target_path=target)
+        elif action == "archive_create":
+            print(f"- 本次生成 zip，不自动删除: {target}")
+            log_undo(log_path, "plan_undo", status="skipped", error_message="archive_create 第一版撤销不删除 zip。", source_path=target, target_path=target)
+        else:
+            print(f"- 跳过未知操作: {action}")
+            log_undo(log_path, "plan_undo", status="skipped", error_message=f"未知操作：{action}", source_path=target, target_path=source)
+    print("====================================\n")
+
+
+def undo_move(source_before: Path, target_after: Path, log_path: Path) -> Tuple[int, int]:
+    if not target_after.exists():
+        message = "撤销来源不存在，跳过。"
+        log_undo(log_path, "undo_skip", status="skipped", error_message=message, source_path=target_after, target_path=source_before)
+        print(f"跳过移回：{message} {target_after}")
+        return 0, 1
+    if source_before.exists():
+        message = "回退目标已存在，跳过，避免覆盖。"
+        log_undo(log_path, "undo_skip", status="skipped", error_message=message, source_path=target_after, target_path=source_before)
+        print(f"跳过移回：{message} {source_before}")
+        return 0, 1
+    if not source_before.parent.exists():
+        message = "回退目标父目录不存在，跳过。"
+        log_undo(log_path, "undo_skip", status="skipped", error_message=message, source_path=target_after, target_path=source_before)
+        print(f"跳过移回：{message} {source_before.parent}")
+        return 0, 1
+    try:
+        shutil.move(str(target_after), str(source_before))
+        log_undo(log_path, "undo_move", source_path=target_after, target_path=source_before)
+        print(f"完成移回：{target_after} -> {source_before}")
+        return 1, 0
+    except Exception as exc:
+        log_undo(log_path, "undo_error", status="failed", error_message=str(exc), source_path=target_after, target_path=source_before)
+        print(f"错误：移回失败 {target_after} -> {source_before}，原因：{exc}")
+        return 0, 1
+
+
+def undo_created_dir(target_after: Path, log_path: Path) -> Tuple[int, int]:
+    if not target_after.exists():
+        message = "本次创建目录已不存在，跳过。"
+        log_undo(log_path, "undo_skip", status="skipped", error_message=message, source_path=target_after, target_path=target_after)
+        print(f"跳过删除空目录：{message} {target_after}")
+        return 0, 1
+    if not target_after.is_dir():
+        message = "记录目标不是目录，跳过。"
+        log_undo(log_path, "undo_skip", status="skipped", error_message=message, source_path=target_after, target_path=target_after)
+        print(f"跳过删除空目录：{message} {target_after}")
+        return 0, 1
+    try:
+        next(target_after.iterdir())
+    except StopIteration:
+        try:
+            target_after.rmdir()
+            log_undo(log_path, "undo_remove_empty_dir", source_path=target_after, target_path=target_after)
+            print(f"完成删除空目录：{target_after}")
+            return 1, 0
+        except Exception as exc:
+            log_undo(log_path, "undo_error", status="failed", error_message=str(exc), source_path=target_after, target_path=target_after)
+            print(f"错误：删除空目录失败 {target_after}，原因：{exc}")
+            return 0, 1
+    except Exception as exc:
+        log_undo(log_path, "undo_error", status="failed", error_message=str(exc), source_path=target_after, target_path=target_after)
+        print(f"错误：检查目录失败 {target_after}，原因：{exc}")
+        return 0, 1
+    message = "目录非空，跳过，避免删除未知文件。"
+    log_undo(log_path, "undo_skip", status="skipped", error_message=message, source_path=target_after, target_path=target_after)
+    print(f"跳过删除空目录：{message} {target_after}")
+    return 0, 1
+
+
+def undo_last(root: Path, log_path: Path, run_log_path: Path, confirmed: bool = False) -> int:
+    try:
+        data = load_run_log(run_log_path)
+    except Exception as exc:
+        message = f"organizer_run_log.json 损坏或无法读取：{exc}"
+        log_undo(log_path, "undo_error", status="failed", error_message=message)
+        print(f"错误：{message}")
+        print("未执行任何撤销移动。")
+        return 1
+
+    run = find_last_undoable_run(data, root)
+    if run is None:
+        log_undo(log_path, "undo_skip", status="skipped", error_message="没有找到可撤销的最近一次 apply run。")
+        print("没有找到可撤销的最近一次 apply run。")
+        return 0
+
+    print_undo_plan(run, log_path)
+    if confirmed:
+        print("已通过 --yes 确认，开始执行 undo-last")
+        log_confirmation(log_path, "undo-last", "arg_yes")
+    else:
+        answer = input("即将执行以上撤销计划，是否继续？输入 YES 后继续：").strip()
+        if answer != "YES":
+            log_undo(log_path, "undo_skip", status="cancelled", error_message="用户未输入 YES，取消撤销。")
+            print("已取消：未输入大写 YES，没有执行任何撤销。")
+            return 0
+        log_confirmation(log_path, "undo-last", "cli_yes")
+
+    success_count = 0
+    issue_count = 0
+    for operation in reversed(run.get("operations", [])):
+        action = operation.get("action", "")
+        target_after = Path(operation["target_after"]) if operation.get("target_after") else None
+        source_before = Path(operation["source_before"]) if operation.get("source_before") else None
+        if action == "move" and source_before is not None and target_after is not None:
+            successes, issues = undo_move(source_before, target_after, log_path)
+            success_count += successes
+            issue_count += issues
+        elif action == "create_dir" and target_after is not None:
+            successes, issues = undo_created_dir(target_after, log_path)
+            success_count += successes
+            issue_count += issues
+        elif action == "archive_create" and target_after is not None:
+            message = "archive_create 第一版撤销不删除 zip；该文件是本次生成产物。"
+            log_undo(log_path, "undo_skip", status="skipped", error_message=message, source_path=target_after, target_path=target_after)
+            print(f"提示：{message} {target_after}")
+        else:
+            issue_count += 1
+            message = f"未知或不完整操作，跳过：{action}"
+            log_undo(log_path, "undo_skip", status="skipped", error_message=message, source_path=target_after, target_path=source_before)
+            print(f"跳过：{message}")
+
+    if issue_count == 0:
+        undo_status = "success"
+    elif success_count > 0:
+        undo_status = "partial"
+    else:
+        undo_status = "failed"
+    update_run_undo_status(run_log_path, data, run, True, undo_status)
+    print(f"undo-last 完成，状态：{undo_status}。日志已写入：{log_path}")
+    return 0
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -954,6 +1443,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="配置文件路径")
     parser.add_argument("--dry-run", action="store_true", help="只预览计划，不执行真实修改")
     parser.add_argument("--apply", action="store_true", help="执行真实整理，执行前仍需输入 YES")
+    parser.add_argument("--undo-last", action="store_true", help="撤销最近一次成功或部分成功的 apply 运行")
+    parser.add_argument("--archive", action="store_true", help="apply 成功后压缩最终文件夹")
+    parser.add_argument("--yes", action="store_true", help="已确认执行 apply 或 undo-last，跳过命令行 YES 输入")
     return parser.parse_args(argv)
 
 
@@ -961,14 +1453,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     config_path = Path(args.config).expanduser().resolve()
-    mode = "apply" if args.apply else "dry-run"
-    log_path = root / "rename_log.csv"
-    if args.apply and args.dry_run:
-        print("错误：--dry-run 和 --apply 不能同时使用。")
+    mode_count = sum(1 for enabled in (args.dry_run, args.apply, args.undo_last) if enabled)
+    if mode_count > 1:
+        print("错误：--dry-run、--apply 和 --undo-last 不能同时使用。")
         return 2
+    if args.archive and args.undo_last:
+        print("错误：--undo-last 模式不支持 --archive")
+        return 2
+    if args.archive and not args.apply:
+        print("错误：--archive 只在 --apply 模式下生效")
+        return 2
+    if args.yes and args.dry_run:
+        print("错误：--yes 不能用于 --dry-run")
+        return 2
+    if args.yes and not (args.apply or args.undo_last):
+        print("错误：--yes 只能与 --apply 或 --undo-last 一起使用")
+        return 2
+    mode = "undo-last" if args.undo_last else ("apply" if args.apply else "dry-run")
+    log_path = root / "rename_log.csv"
+    run_log_path = root / RUN_LOG_NAME
     if not root.exists() or not root.is_dir():
         print(f"错误：root 不是有效目录：{root}")
         return 2
+    if args.undo_last:
+        return undo_last(root, log_path, run_log_path, confirmed=args.yes)
     try:
         config = load_config(config_path)
         validate_config(config)
@@ -977,26 +1485,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"配置错误：{exc}")
         return 1
     try:
-        items, groups = build_plan(root, config, mode, log_path)
-        print_plan(root, config, items, groups, mode)
+        items, groups = build_plan(root, config, mode, log_path, archive_enabled=args.archive)
+        print_plan(root, config, items, groups, mode, archive_enabled=args.archive)
     except Exception as exc:
         write_log(log_path, {"time": now_text(), "mode": mode, "action": "plan_skip" if mode == "dry-run" else "skip", "status": "failed", "error_message": str(exc)})
         print(f"生成计划失败：{exc}")
         return 1
     if mode == "dry-run":
-        print("dry-run 完成：没有解压、移动、重命名或合并任何文件夹。")
+        print("dry-run 完成：没有解压、移动、重命名、合并或压缩任何文件夹。")
         print(f"日志已写入：{log_path}")
         return 0
-    answer = input("即将执行以上整理计划，是否继续？输入 YES 后继续：").strip()
-    if answer != "YES":
-        write_log(log_path, {"time": now_text(), "mode": "apply", "action": "skip", "status": "cancelled", "error_message": "用户未输入 YES，取消执行。"})
-        print("已取消：未输入大写 YES，没有执行任何真实修改。")
-        return 0
+    if args.yes:
+        print("已通过 --yes 确认，开始执行 apply")
+        log_confirmation(log_path, "apply", "arg_yes")
+    else:
+        answer = input("即将执行以上整理计划，是否继续？输入 YES 后继续：").strip()
+        if answer != "YES":
+            write_log(log_path, {"time": now_text(), "mode": "apply", "action": "skip", "status": "cancelled", "error_message": "用户未输入 YES，取消执行。"})
+            print("已取消：未输入大写 YES，没有执行任何真实修改。")
+            return 0
+        log_confirmation(log_path, "apply", "cli_yes")
+    try:
+        run_log_data, run = create_apply_run(root, run_log_path)
+    except Exception as exc:
+        write_log(log_path, {"time": now_text(), "mode": "apply", "action": "skip", "status": "failed", "error_message": f"无法创建 organizer_run_log.json：{exc}"})
+        print(f"错误：无法创建 organizer_run_log.json：{exc}")
+        print("未执行任何真实整理。")
+        return 1
     for item in items:
         if item.skip_reason:
             log_item(log_path, "apply", "skip", item, status="skipped", error_message=item.skip_reason)
-    apply_plan(groups, log_path)
-    print(f"apply 完成。日志已写入：{log_path}")
+    completed_groups, failed_count = apply_plan(groups, log_path, run_log_path, run_log_data, run)
+    if args.archive:
+        failed_count += compress_groups(completed_groups, log_path, run_log_path, run_log_data, run)
+    operation_count = len(run.get("operations", []))
+    if operation_count == 0:
+        run_status = "failed"
+    elif failed_count:
+        run_status = "partial"
+    else:
+        run_status = "success"
+    update_run_status(run_log_path, run_log_data, run, run_status)
+    print(f"apply 完成，状态：{run_status}。日志已写入：{log_path}")
+    print(f"可撤销操作日志已写入：{run_log_path}")
     return 0
 
 
