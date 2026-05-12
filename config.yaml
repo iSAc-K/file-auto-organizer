@@ -119,7 +119,7 @@ do_not_merge_keywords:
 naming:
   single_keep_original: true
   single_template: "{seq}-{clean_original_name}"
-  merged_template: "{seq_range}-{category}-{orders}单-{quantity}个"
+  merged_template: "{seq_range}-{date}-{category}-{orders}单-{quantity}个"
   custom_text: ""
   merge_name: ""
 

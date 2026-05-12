@@ -114,7 +114,7 @@ do_not_merge_keywords:
 naming:
   single_keep_original: true
   single_template: "{seq}-{clean_original_name}"
-  merged_template: "{seq_range}-{category}-{orders}单-{quantity}个"
+  merged_template: "{seq_range}-{date}-{category}-{orders}单-{quantity}个"
 ```
 
 支持占位符：
@@ -130,7 +130,7 @@ naming:
 - `{custom_text}`：自定义文字
 - `{merge_name}`：自定义合并组名称
 
-单个不合并文件夹默认只在清理后原名最前面加序号。合并文件夹默认不使用日期，命名为 `序号范围-标准品类-单量-数量`。
+单个不合并文件夹默认只在清理后原名最前面加序号，不重构为标准品类命名。合并文件夹默认使用 `序号范围-日期-标准品类-单量-数量`，同一天显示单个日期，多日期显示最小日期到最大日期。
 
 内部来源文件夹模板：
 
@@ -148,6 +148,8 @@ inner_folder_naming:
 - `0507`
 - `05-07`
 - `05.07`
+- `5.7`
+- `4.26`
 - `2026-05-07`
 - `2026.05.07`
 - `20260507`

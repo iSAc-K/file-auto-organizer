@@ -68,7 +68,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "naming": {
         "single_keep_original": True,
         "single_template": "{seq}-{clean_original_name}",
-        "merged_template": "{seq_range}-{category}-{orders}单-{quantity}个",
+        "merged_template": "{seq_range}-{date}-{category}-{orders}单-{quantity}个",
         "custom_text": "",
         "merge_name": "",
     },
@@ -330,6 +330,8 @@ def validate_config(config: Dict[str, Any]) -> None:
     inner_allowed = {"seq", "original_name", "clean_original_name", "category", "date", "orders", "quantity"}
     validate_template("naming.single_template", config["naming"]["single_template"], naming_allowed)
     validate_template("naming.merged_template", config["naming"]["merged_template"], naming_allowed)
+    if "date" not in placeholders(config["naming"]["merged_template"]):
+        raise ConfigError("naming.merged_template 必须包含 {date}，合并文件夹最终名称必须带日期。")
     validate_template("inner_folder_naming.template", config["inner_folder_naming"]["template"], inner_allowed)
 
 
@@ -683,7 +685,7 @@ def priority_index(text: str, keywords: Sequence[str]) -> int:
 
 
 def clean_windows_duplicate_suffix(name: str) -> Tuple[str, bool]:
-    cleaned = re.sub(r"\(\d+\)$", "", name).rstrip()
+    cleaned = re.sub(r"\s*\(\d+\)\s*$", "", name).rstrip()
     return cleaned or name, cleaned != name
 
 
@@ -1095,11 +1097,22 @@ def print_plan(root: Path, config: Dict[str, Any], items: List[WorkItem], groups
         if group.is_merge:
             print(f"  合并组：{group.category}")
             print(f"  来源数量：{len(group.items)} 个")
+            print("  来源：")
+            for item in group.items:
+                seq_label = item.sequence_number if item.sequence_number is not None else "未分配"
+                print(f"  {seq_label}：{item.original_name}，日期：{item.detection.date_label}")
+            print(f"  合并日期：{group.date_label}")
+            print(f"  最终合并名称：{group.final_name}")
             print("  来源明细：")
             for item in group.items:
                 seq_label = item.sequence_number if item.sequence_number is not None else "未分配"
                 print(f"  - {seq_label}：{item.detection.orders}单{item.detection.quantity}个")
             print(f"  合计：{group.orders}单{group.quantity}个")
+        else:
+            item = group.items[0]
+            print(f"  原始名称：{item.original_name}")
+            print(f"  最终名称：{group.final_name}")
+            print("  说明：未合并，仅添加序号，保留原始名称。")
         if group.is_merge:
             print("  合并后内部结构计划：")
             print(f"  {group.final_name}\\")
