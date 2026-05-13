@@ -117,7 +117,7 @@ def load_settings(settings_path: Path, defaults: LauncherSettings) -> LauncherSe
     with settings_path.open("r", encoding="utf-8") as f:
         loaded = json.load(f)
     if not isinstance(loaded, dict):
-        raise ValueError("launcher_settings.json must contain an object")
+        raise ValueError("launcher_settings.json 顶层必须是对象。")
     return settings_from_dict(loaded, defaults)
 
 
@@ -129,21 +129,21 @@ def save_settings(settings_path: Path, settings: LauncherSettings) -> None:
 
 def validate_paths(settings: LauncherSettings) -> tuple[ValidationResult | None, str | None]:
     if not settings.python_command.strip():
-        return None, "Python command cannot be empty."
+        return None, "Python 命令不能为空。"
 
     script_value = clean_path_value(settings.script_path)
     if not script_value:
-        return None, "file_helper.py path cannot be empty."
+        return None, "file_helper.py 路径不能为空。"
     script_path = Path(script_value)
     if not script_path.exists() or not script_path.is_file():
-        return None, f"file_helper.py does not exist: {script_path}"
+        return None, f"file_helper.py 不存在：\n{script_path}"
 
     root_value = clean_path_value(settings.root_path)
     if not root_value:
-        return None, "Root folder path cannot be empty."
+        return None, "要处理的文件夹路径不能为空。"
     root_path = Path(root_value)
     if not root_path.exists() or not root_path.is_dir():
-        return None, f"Root folder does not exist: {root_path}"
+        return None, f"要处理的文件夹不存在：\n{root_path}"
 
     if settings.mode == "undo-last":
         return ValidationResult(script_path=script_path, root_path=root_path, config_path=None), None
@@ -151,7 +151,7 @@ def validate_paths(settings: LauncherSettings) -> tuple[ValidationResult | None,
     config_value = clean_path_value(settings.config_path)
     config_path = Path(config_value) if config_value else None
     if config_path is not None and (not config_path.exists() or not config_path.is_file()):
-        return None, f"config.yaml does not exist: {config_path}"
+        return None, f"config.yaml 不存在：\n{config_path}"
 
     return ValidationResult(script_path=script_path, root_path=root_path, config_path=config_path), None
 
@@ -169,7 +169,7 @@ def build_command(settings: LauncherSettings, include_yes: bool = False) -> str:
     )
     validated, error = validate_paths(normalized)
     if validated is None:
-        raise ValueError(error or "Invalid launcher settings.")
+        raise ValueError(error or "启动器设置无效。")
 
     parts = [
         format_python_command(normalized.python_command),

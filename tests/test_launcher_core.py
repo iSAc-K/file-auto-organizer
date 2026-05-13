@@ -42,12 +42,14 @@ class LauncherCoreTests(unittest.TestCase):
                 open_result_folder=False,
             )
 
-            command = build_command(settings)
+            normal_command = build_command(settings)
+            mistakenly_confirmed_command = build_command(settings, include_yes=True)
 
-        self.assertIn("--dry-run", command)
-        self.assertIn("--config", command)
-        self.assertNotIn("--yes", command)
-        self.assertNotIn("Start-Process", command)
+        for command in (normal_command, mistakenly_confirmed_command):
+            self.assertIn("--dry-run", command)
+            self.assertIn("--config", command)
+            self.assertNotIn("--yes", command)
+            self.assertNotIn("Start-Process", command)
 
     def test_build_apply_archive_command_adds_yes_only_when_requested(self):
         with tempfile.TemporaryDirectory() as tmp:
