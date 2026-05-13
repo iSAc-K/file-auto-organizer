@@ -2,121 +2,110 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+
+from launcher_core import (
+    SETTINGS_NAME,
+    LauncherSettings,
+    app_base_dir,
+    build_command,
+    clean_path_value,
+    default_settings,
+    settings_from_dict,
+    settings_to_dict,
+    validate_paths,
+)
 
 
 APP_TITLE = "Windows 文件整理助手"
-SETTINGS_NAME = "launcher_settings.json"
 
-
-def ps_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def clean_path_value(value: str) -> str:
-    return value.strip().strip('"').strip("'")
-
-
-def format_python_command(command: str) -> str:
-    value = clean_path_value(command)
-    lower_value = value.lower()
-    looks_like_path = (
-        "\\" in value
-        or "/" in value
-        or ":" in value
-        or lower_value.endswith(".exe")
-    )
-    if looks_like_path:
-        return f"& {ps_quote(value)}"
-    return value
-
-
-def app_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+MODE_LABELS = {
+    "dry-run": "预览模式",
+    "apply": "执行整理",
+    "undo-last": "撤销上次",
+}
 
 
 class LauncherGui:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.minsize(900, 600)
+        self.root.minsize(1080, 680)
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
 
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
-        self.defaults = self.default_settings()
+        self.defaults = default_settings(self.base_dir)
         settings = self.load_settings()
 
-        self.python_command = tk.StringVar(value=settings["python_command"])
-        self.script_path = tk.StringVar(value=settings["script_path"])
-        self.root_path = tk.StringVar(value=settings["root_path"])
-        self.config_path = tk.StringVar(value=settings["config_path"])
-        self.run_mode = tk.StringVar(value=settings["mode"])
-        self.use_archive = tk.BooleanVar(value=bool(settings["archive_enabled"]))
-        self.open_result_folder = tk.BooleanVar(value=bool(settings["open_result_folder"]))
-        self.archive_check: ttk.Checkbutton | None = None
+        self.python_command = ctk.StringVar(value=settings.python_command)
+        self.script_path = ctk.StringVar(value=settings.script_path)
+        self.root_path = ctk.StringVar(value=settings.root_path)
+        self.config_path = ctk.StringVar(value=settings.config_path)
+        self.run_mode = ctk.StringVar(value=settings.mode)
+        self.use_archive = ctk.BooleanVar(value=bool(settings.archive_enabled))
+        self.open_result_folder = ctk.BooleanVar(value=bool(settings.open_result_folder))
+
+        self.mode_buttons: dict[str, ctk.CTkButton] = {}
+        self.path_status_labels: dict[str, ctk.CTkLabel] = {}
+        self.archive_check: ctk.CTkCheckBox | None = None
 
         self._build_ui()
         self.run_mode.trace_add("write", self.on_mode_changed)
+        for variable in (
+            self.python_command,
+            self.script_path,
+            self.root_path,
+            self.config_path,
+        ):
+            variable.trace_add("write", self.update_path_status)
         self.on_mode_changed()
+        self.update_path_status()
 
-    def default_settings(self) -> dict[str, object]:
-        default_script = self.base_dir / "file_helper.py"
-        default_config = self.base_dir / "config.yaml"
-        return {
-            "python_command": "py",
-            "script_path": str(default_script) if default_script.exists() else "",
-            "root_path": "",
-            "config_path": str(default_config) if default_config.exists() else "",
-            "mode": "dry-run",
-            "archive_enabled": False,
-            "open_result_folder": True,
-        }
-
-    def load_settings(self) -> dict[str, object]:
-        settings = dict(self.defaults)
+    def load_settings(self) -> LauncherSettings:
         if not self.settings_path.exists():
-            return settings
+            return self.defaults
         try:
             with self.settings_path.open("r", encoding="utf-8") as f:
                 loaded = json.load(f)
             if not isinstance(loaded, dict):
                 raise ValueError("设置文件顶层必须是对象。")
         except Exception as exc:
-            messagebox.showwarning(APP_TITLE, f"launcher_settings.json 已损坏，已使用默认设置。\n{exc}")
-            return settings
-        for key in settings:
-            if key in loaded:
-                settings[key] = loaded[key]
-        if settings.get("mode") not in {"dry-run", "apply", "undo-last"}:
-            settings["mode"] = "dry-run"
-        return settings
+            messagebox.showwarning(
+                APP_TITLE,
+                f"launcher_settings.json 已损坏，已使用默认设置。\n{exc}",
+            )
+            return self.defaults
+        return settings_from_dict(loaded, self.defaults)
 
-    def current_settings(self) -> dict[str, object]:
-        return {
-            "python_command": self.python_command.get().strip(),
-            "script_path": clean_path_value(self.script_path.get()),
-            "root_path": clean_path_value(self.root_path.get()),
-            "config_path": clean_path_value(self.config_path.get()),
-            "mode": self.run_mode.get(),
-            "archive_enabled": bool(self.use_archive.get()),
-            "open_result_folder": bool(self.open_result_folder.get()),
-        }
+    def current_settings(self) -> LauncherSettings:
+        mode = self.run_mode.get()
+        if mode not in {"dry-run", "apply", "undo-last"}:
+            mode = "dry-run"
+        return LauncherSettings(
+            python_command=self.python_command.get().strip(),
+            script_path=clean_path_value(self.script_path.get()),
+            root_path=clean_path_value(self.root_path.get()),
+            config_path=clean_path_value(self.config_path.get()),
+            mode=mode,  # type: ignore[arg-type]
+            archive_enabled=bool(self.use_archive.get()),
+            open_result_folder=bool(self.open_result_folder.get()),
+        )
 
     def save_settings(self, show_message: bool = True) -> None:
         try:
             with self.settings_path.open("w", encoding="utf-8", newline="\n") as f:
-                json.dump(self.current_settings(), f, ensure_ascii=False, indent=2)
+                json.dump(settings_to_dict(self.current_settings()), f, ensure_ascii=False, indent=2)
                 f.write("\n")
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"保存设置失败：\n{exc}")
             return
         if show_message:
-            messagebox.showinfo(APP_TITLE, "设置已保存")
+            messagebox.showinfo(APP_TITLE, "设置已保存。")
 
     def clear_settings(self) -> None:
         try:
@@ -126,88 +115,431 @@ class LauncherGui:
             messagebox.showerror(APP_TITLE, f"清空设置失败：\n{exc}")
             return
         self.apply_settings(self.defaults)
-        messagebox.showinfo(APP_TITLE, "已清空保存的路径和选项")
+        messagebox.showinfo(APP_TITLE, "已清空保存的路径和选项。")
 
-    def apply_settings(self, settings: dict[str, object]) -> None:
-        self.python_command.set(str(settings["python_command"]))
-        self.script_path.set(str(settings["script_path"]))
-        self.root_path.set(str(settings["root_path"]))
-        self.config_path.set(str(settings["config_path"]))
-        self.run_mode.set(str(settings["mode"]))
-        self.use_archive.set(bool(settings["archive_enabled"]))
-        self.open_result_folder.set(bool(settings["open_result_folder"]))
+    def apply_settings(self, settings: LauncherSettings) -> None:
+        self.python_command.set(settings.python_command)
+        self.script_path.set(settings.script_path)
+        self.root_path.set(settings.root_path)
+        self.config_path.set(settings.config_path)
+        self.run_mode.set(settings.mode)
+        self.use_archive.set(bool(settings.archive_enabled))
+        self.open_result_folder.set(bool(settings.open_result_folder))
         self.set_preview("")
+        self.update_path_status()
 
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=16)
-        main.grid(row=0, column=0, sticky="nsew")
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main.columnconfigure(1, weight=1)
+        self.root.configure(fg_color="#EEF2F4")
+        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
 
-        ttk.Label(main, text="Python 命令").grid(row=0, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.python_command).grid(row=0, column=1, sticky="ew", pady=6)
-        ttk.Label(
-            main,
-            text=r"示例：py、python、C:\Users\kt\AppData\Local\Programs\Python\Python313\python.exe",
-            foreground="#555555",
-        ).grid(row=1, column=1, sticky="w")
+        sidebar = ctk.CTkFrame(self.root, fg_color="#101820", corner_radius=0, width=238)
+        sidebar.grid(row=0, column=0, sticky="nsew")
+        sidebar.grid_propagate(False)
+        sidebar.grid_rowconfigure(5, weight=1)
 
-        ttk.Label(main, text="file_helper.py 路径").grid(row=2, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.script_path).grid(row=2, column=1, sticky="ew", pady=6)
-        ttk.Button(main, text="选择脚本", command=self.select_script).grid(row=2, column=2, padx=(8, 0), pady=6)
+        ctk.CTkLabel(
+            sidebar,
+            text="Windows\n文件整理助手",
+            text_color="#F7FAFC",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=23, weight="bold"),
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=22, pady=(28, 6))
+        ctk.CTkLabel(
+            sidebar,
+            text="预览优先 / 确认执行 / 可撤销",
+            text_color="#98A6B3",
+            font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 28))
 
-        ttk.Label(main, text="要处理的文件夹路径").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.root_path).grid(row=3, column=1, sticky="ew", pady=6)
-        ttk.Button(main, text="选择文件夹", command=self.select_root_folder).grid(row=3, column=2, padx=(8, 0), pady=6)
+        self._add_mode_button(sidebar, "dry-run", "预览模式", "--dry-run，不修改文件", 2)
+        self._add_mode_button(sidebar, "apply", "执行整理", "--apply，需要确认", 3)
+        self._add_mode_button(sidebar, "undo-last", "撤销上次", "--undo-last", 4)
 
-        ttk.Label(main, text="config.yaml 路径").grid(row=4, column=0, sticky="w", pady=6)
-        ttk.Entry(main, textvariable=self.config_path).grid(row=4, column=1, sticky="ew", pady=6)
-        ttk.Button(main, text="选择配置文件", command=self.select_config).grid(row=4, column=2, padx=(8, 0), pady=6)
+        self.safety_status = ctk.CTkLabel(
+            sidebar,
+            text="当前不会修改文件",
+            text_color="#DFF3E8",
+            anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.safety_status.grid(row=6, column=0, sticky="sew", padx=22, pady=(0, 26))
 
-        ttk.Label(main, text="运行模式").grid(row=5, column=0, sticky="w", pady=6)
-        mode_frame = ttk.Frame(main)
-        mode_frame.grid(row=5, column=1, sticky="w", pady=6)
-        ttk.Radiobutton(mode_frame, text="预览模式（--dry-run）", variable=self.run_mode, value="dry-run").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(mode_frame, text="执行模式（--apply）", variable=self.run_mode, value="apply").grid(row=0, column=1, sticky="w", padx=(18, 0))
-        ttk.Radiobutton(mode_frame, text="撤销上次整理（--undo-last）", variable=self.run_mode, value="undo-last").grid(row=0, column=2, sticky="w", padx=(18, 0))
+        workspace = ctk.CTkFrame(self.root, fg_color="#EEF2F4", corner_radius=0)
+        workspace.grid(row=0, column=1, sticky="nsew", padx=26, pady=24)
+        workspace.grid_columnconfigure(0, weight=1)
+        workspace.grid_rowconfigure(2, weight=1)
 
-        ttk.Label(main, text="可选项").grid(row=6, column=0, sticky="w", pady=6)
-        options_frame = ttk.Frame(main)
-        options_frame.grid(row=6, column=1, columnspan=2, sticky="w", pady=6)
-        self.archive_check = ttk.Checkbutton(
-            options_frame,
+        self._build_header(workspace)
+
+        content = ctk.CTkFrame(workspace, fg_color="transparent")
+        content.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, minsize=310)
+        content.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkFrame(content, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(4, weight=1)
+
+        self._add_path_card(
+            left,
+            0,
+            "Python 命令",
+            self.python_command,
+            None,
+            r"示例：py、python、C:\Program Files\Python\python.exe",
+        )
+        self._add_path_card(
+            left,
+            1,
+            "file_helper.py 路径",
+            self.script_path,
+            self.select_script,
+            "启动器只调用这个脚本，不在界面里实现整理逻辑。",
+        )
+        self._add_path_card(
+            left,
+            2,
+            "要处理的文件夹路径",
+            self.root_path,
+            self.select_root_folder,
+            "请选择待整理的根目录。预览模式不会修改其中的文件。",
+        )
+        self._add_path_card(
+            left,
+            3,
+            "config.yaml 路径",
+            self.config_path,
+            self.select_config,
+            "可留空；撤销上次模式不使用 config.yaml。",
+        )
+        self._build_command_area(left)
+
+        right = ctk.CTkFrame(content, fg_color="#FFFFFF", border_color="#D6DEE5", border_width=1, corner_radius=8)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        self._build_options_area(right)
+
+        self._build_action_bar(workspace)
+
+    def _build_header(self, parent: ctk.CTkFrame) -> None:
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header,
+            text="整理任务启动器",
+            text_color="#101820",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=28, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        self.mode_badge = ctk.CTkLabel(
+            header,
+            text="Dry Run",
+            fg_color="#DFF3E8",
+            text_color="#176342",
+            corner_radius=14,
+            height=28,
+            width=96,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.mode_badge.grid(row=0, column=1, sticky="e")
+        self.mode_description = ctk.CTkLabel(
+            header,
+            text="先生成预览命令，确认计划后再执行真实整理。",
+            text_color="#5E6B75",
+            font=ctk.CTkFont(size=13),
+        )
+        self.mode_description.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+    def _add_mode_button(
+        self,
+        parent: ctk.CTkFrame,
+        value: str,
+        title: str,
+        subtitle: str,
+        row: int,
+    ) -> None:
+        button = ctk.CTkButton(
+            parent,
+            text=f"{title}\n{subtitle}",
+            command=lambda: self.run_mode.set(value),
+            anchor="w",
+            justify="left",
+            height=58,
+            fg_color="#1B2630",
+            hover_color="#24313C",
+            text_color="#DCE6EE",
+            corner_radius=8,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        button.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.mode_buttons[value] = button
+
+    def _add_path_card(
+        self,
+        parent: ctk.CTkFrame,
+        row: int,
+        label: str,
+        variable: ctk.StringVar,
+        browse_command: object,
+        hint: str,
+    ) -> None:
+        card = ctk.CTkFrame(
+            parent,
+            fg_color="#FFFFFF",
+            border_color="#D6DEE5",
+            border_width=1,
+            corner_radius=8,
+        )
+        card.grid(row=row, column=0, sticky="ew", pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+
+        top = ctk.CTkFrame(card, fg_color="transparent")
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 6))
+        top.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            top,
+            text=label,
+            text_color="#4F5E69",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        status = ctk.CTkLabel(top, text="", text_color="#6A7884", font=ctk.CTkFont(size=12))
+        status.grid(row=0, column=1, sticky="e")
+        self.path_status_labels[label] = status
+
+        entry = ctk.CTkEntry(
+            card,
+            textvariable=variable,
+            height=38,
+            border_color="#D6DEE5",
+            fg_color="#F6F8FA",
+        )
+        entry.grid(row=1, column=0, sticky="ew", padx=(14, 8), pady=(0, 10))
+        if browse_command is not None:
+            ctk.CTkButton(
+                card,
+                text="选择",
+                command=browse_command,
+                width=74,
+                height=38,
+                fg_color="#101820",
+                hover_color="#24313C",
+            ).grid(row=1, column=1, sticky="e", padx=(0, 14), pady=(0, 10))
+        ctk.CTkLabel(
+            card,
+            text=hint,
+            text_color="#7A8791",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 12))
+
+    def _build_options_area(self, parent: ctk.CTkFrame) -> None:
+        ctk.CTkLabel(
+            parent,
+            text="模式说明",
+            text_color="#101820",
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(18, 8))
+        self.mode_help = ctk.CTkLabel(
+            parent,
+            text="",
+            text_color="#4F5E69",
+            justify="left",
+            wraplength=260,
+        )
+        self.mode_help.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 18))
+
+        ctk.CTkLabel(
+            parent,
+            text="选项",
+            text_color="#101820",
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).grid(row=2, column=0, sticky="w", padx=16, pady=(0, 8))
+        self.archive_check = ctk.CTkCheckBox(
+            parent,
             text="整理完成后压缩最终文件夹",
             variable=self.use_archive,
+            fg_color="#F05A28",
+            hover_color="#C84418",
         )
-        self.archive_check.grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(
-            options_frame,
+        self.archive_check.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 10))
+        ctk.CTkCheckBox(
+            parent,
             text="处理完成后打开结果目录",
             variable=self.open_result_folder,
-        ).grid(row=0, column=1, sticky="w", padx=(18, 0))
+            fg_color="#F05A28",
+            hover_color="#C84418",
+        ).grid(row=4, column=0, sticky="w", padx=16, pady=(0, 18))
 
-        ttk.Label(main, text="命令预览").grid(row=7, column=0, sticky="nw", pady=(14, 6))
-        self.command_preview = tk.Text(main, height=7, wrap="word")
-        self.command_preview.grid(row=7, column=1, columnspan=2, sticky="nsew", pady=(14, 6))
-        main.rowconfigure(7, weight=1)
+        ctk.CTkLabel(
+            parent,
+            text="设置",
+            text_color="#101820",
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).grid(row=5, column=0, sticky="w", padx=16, pady=(0, 8))
+        ctk.CTkLabel(
+            parent,
+            text="保存设置只记录路径和启动选项，不保存客户文件内容。",
+            text_color="#667580",
+            justify="left",
+            wraplength=260,
+        ).grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 12))
+        ctk.CTkButton(
+            parent,
+            text="保存设置",
+            command=self.save_settings,
+            fg_color="#101820",
+            hover_color="#24313C",
+        ).grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 8))
+        ctk.CTkButton(
+            parent,
+            text="清空设置",
+            command=self.clear_settings,
+            fg_color="#FFFFFF",
+            text_color="#101820",
+            border_color="#C7D0D8",
+            border_width=1,
+            hover_color="#EEF2F4",
+        ).grid(row=8, column=0, sticky="ew", padx=16)
 
-        button_frame = ttk.Frame(main)
-        button_frame.grid(row=8, column=1, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(button_frame, text="生成命令", command=self.generate_command).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(button_frame, text="复制命令", command=self.copy_command).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(button_frame, text="在 PowerShell 中运行", command=self.run_in_powershell).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(button_frame, text="保存设置", command=self.save_settings).grid(row=0, column=3, padx=(0, 8))
-        ttk.Button(button_frame, text="清空已保存路径", command=self.clear_settings).grid(row=0, column=4)
+    def _build_command_area(self, parent: ctk.CTkFrame) -> None:
+        card = ctk.CTkFrame(
+            parent,
+            fg_color="#FFFFFF",
+            border_color="#D6DEE5",
+            border_width=1,
+            corner_radius=8,
+        )
+        card.grid(row=4, column=0, sticky="nsew")
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(1, weight=1)
+        parent.grid_rowconfigure(4, weight=1)
+        ctk.CTkLabel(
+            card,
+            text="命令预览",
+            text_color="#101820",
+            font=ctk.CTkFont(size=16, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 8))
+        self.command_preview = ctk.CTkTextbox(
+            card,
+            height=150,
+            wrap="word",
+            fg_color="#101820",
+            text_color="#DCE6EE",
+            border_width=0,
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        self.command_preview.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
+        ctk.CTkLabel(
+            card,
+            text="普通预览和复制命令不带 --yes；只有确认执行或撤销后才追加。",
+            text_color="#667580",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=2, column=0, sticky="w", padx=14, pady=(0, 14))
+
+    def _build_action_bar(self, parent: ctk.CTkFrame) -> None:
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        bar.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(
+            bar,
+            text="生成命令",
+            command=self.generate_command,
+            fg_color="#FFFFFF",
+            text_color="#101820",
+            border_color="#C7D0D8",
+            border_width=1,
+            hover_color="#E2E8EE",
+        ).grid(row=0, column=1, padx=(0, 10))
+        ctk.CTkButton(
+            bar,
+            text="复制命令",
+            command=self.copy_command,
+            fg_color="#FFFFFF",
+            text_color="#101820",
+            border_color="#C7D0D8",
+            border_width=1,
+            hover_color="#E2E8EE",
+        ).grid(row=0, column=2, padx=(0, 10))
+        ctk.CTkButton(
+            bar,
+            text="在 PowerShell 中运行",
+            command=self.run_in_powershell,
+            fg_color="#F05A28",
+            hover_color="#C84418",
+            width=178,
+        ).grid(row=0, column=3)
 
     def on_mode_changed(self, *_args: object) -> None:
-        if self.archive_check is None:
-            return
-        if self.run_mode.get() == "undo-last":
+        mode = self.run_mode.get()
+        for value, button in self.mode_buttons.items():
+            if value == mode:
+                button.configure(fg_color="#F05A28", hover_color="#C84418", text_color="#FFFFFF")
+            else:
+                button.configure(fg_color="#1B2630", hover_color="#24313C", text_color="#DCE6EE")
+
+        if mode == "apply":
+            self.mode_badge.configure(text="Apply", fg_color="#FFE7D8", text_color="#9B3417")
+            self.safety_status.configure(text="真实整理需要确认", text_color="#FFE7D8")
+            self.mode_description.configure(text="执行前请先查看 dry-run 结果；确认后启动器会追加一次性 --yes。")
+            self.mode_help.configure(text="执行模式会移动、合并、重命名文件夹。点击运行时会先弹窗确认。")
+            if self.archive_check is not None:
+                self.archive_check.configure(state="normal")
+        elif mode == "undo-last":
             self.use_archive.set(False)
-            self.archive_check.state(["disabled"])
+            self.mode_badge.configure(text="Undo", fg_color="#FFE7D8", text_color="#9B3417")
+            self.safety_status.configure(text="撤销需要确认", text_color="#FFE7D8")
+            self.mode_description.configure(text="撤销只根据 organizer_run_log.json 记录执行，不根据文件名猜测。")
+            self.mode_help.configure(text="撤销模式不使用 config.yaml，也不会启用压缩选项。")
+            if self.archive_check is not None:
+                self.archive_check.configure(state="disabled")
         else:
-            self.archive_check.state(["!disabled"])
+            self.mode_badge.configure(text="Dry Run", fg_color="#DFF3E8", text_color="#176342")
+            self.safety_status.configure(text="当前不会修改文件", text_color="#DFF3E8")
+            self.mode_description.configure(text="先生成预览命令，确认计划后再执行真实整理。")
+            self.mode_help.configure(text="预览模式只扫描并输出整理计划，不移动、不合并、不压缩任何文件。")
+            if self.archive_check is not None:
+                self.archive_check.configure(state="normal")
+        self.update_path_status()
+
+    def update_path_status(self, *_args: object) -> None:
+        statuses = {
+            "Python 命令": (
+                "已填写" if self.python_command.get().strip() else "未填写",
+                "#176342" if self.python_command.get().strip() else "#9B3417",
+            ),
+            "file_helper.py 路径": self._path_status(
+                self.script_path.get(),
+                expect_file=True,
+                empty_text="未选择",
+            ),
+            "要处理的文件夹路径": self._path_status(
+                self.root_path.get(),
+                expect_file=False,
+                empty_text="未选择",
+            ),
+            "config.yaml 路径": (
+                ("不使用", "#7A8791")
+                if self.run_mode.get() == "undo-last"
+                else self._path_status(self.config_path.get(), expect_file=True, empty_text="可留空")
+            ),
+        }
+        for label, (text, color) in statuses.items():
+            widget = self.path_status_labels.get(label)
+            if widget is not None:
+                widget.configure(text=text, text_color=color)
+
+    def _path_status(self, value: str, expect_file: bool, empty_text: str) -> tuple[str, str]:
+        cleaned = clean_path_value(value)
+        if not cleaned:
+            color = "#9B3417" if empty_text == "未选择" else "#7A8791"
+            return empty_text, color
+        path = Path(cleaned)
+        exists = path.is_file() if expect_file else path.is_dir()
+        if exists:
+            return "已找到", "#176342"
+        return "路径不存在", "#9B3417"
 
     def select_script(self) -> None:
         path = filedialog.askopenfilename(
@@ -230,80 +562,26 @@ class LauncherGui:
         if path:
             self.config_path.set(path)
 
-    def validate_inputs(self) -> tuple[Path, Path, Path | None] | None:
-        if not self.python_command.get().strip():
-            messagebox.showerror(APP_TITLE, "Python 命令不能为空。")
-            return None
-
-        script_value = clean_path_value(self.script_path.get())
-        if not script_value:
-            messagebox.showerror(APP_TITLE, "file_helper.py 路径不能为空。")
-            return None
-        script_path = Path(script_value)
-        if not script_path.exists() or not script_path.is_file():
-            messagebox.showerror(APP_TITLE, f"file_helper.py 不存在：\n{script_path}")
-            return None
-
-        root_value = clean_path_value(self.root_path.get())
-        if not root_value:
-            messagebox.showerror(APP_TITLE, "要处理的文件夹路径不能为空。")
-            return None
-        root_path = Path(root_value)
-        if not root_path.exists() or not root_path.is_dir():
-            messagebox.showerror(APP_TITLE, f"要处理的文件夹不存在：\n{root_path}")
-            return None
-
-        if self.run_mode.get() == "undo-last":
-            return script_path, root_path, None
-
-        config_value = clean_path_value(self.config_path.get())
-        config_path = Path(config_value) if config_value else None
-        if config_path and (not config_path.exists() or not config_path.is_file()):
-            messagebox.showerror(APP_TITLE, f"config.yaml 不存在：\n{config_path}")
-            return None
-
-        return script_path, root_path, config_path
+    def validate_inputs(self) -> bool:
+        _validated, error_message = validate_paths(self.current_settings())
+        if error_message:
+            messagebox.showerror(APP_TITLE, error_message)
+            return False
+        return True
 
     def build_command(self, include_yes: bool = False) -> str | None:
-        validated = self.validate_inputs()
-        if validated is None:
+        try:
+            return build_command(self.current_settings(), include_yes=include_yes)
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
             return None
 
-        script_path, root_path, config_path = validated
-        parts = [
-            format_python_command(self.python_command.get()),
-            ps_quote(script_path),
-            "--root",
-            ps_quote(root_path),
-        ]
-
-        mode = self.run_mode.get()
-        if mode != "undo-last" and config_path is not None:
-            parts.extend(["--config", ps_quote(config_path)])
-
-        if mode == "apply":
-            parts.append("--apply")
-            if self.use_archive.get():
-                parts.append("--archive")
-        elif mode == "undo-last":
-            parts.append("--undo-last")
-        else:
-            parts.append("--dry-run")
-
-        if include_yes:
-            parts.append("--yes")
-
-        command = " ".join(parts)
-        if self.open_result_folder.get():
-            command += f"; if ($LASTEXITCODE -eq 0) {{ Start-Process -FilePath {ps_quote(root_path)} }}"
-        return command
-
     def set_preview(self, command: str) -> None:
-        self.command_preview.delete("1.0", tk.END)
+        self.command_preview.delete("1.0", "end")
         self.command_preview.insert("1.0", command)
 
     def get_preview(self) -> str:
-        return self.command_preview.get("1.0", tk.END).strip()
+        return self.command_preview.get("1.0", "end").strip()
 
     def generate_command(self) -> str | None:
         command = self.build_command()
@@ -320,7 +598,7 @@ class LauncherGui:
         self.root.clipboard_clear()
         self.root.clipboard_append(command)
         self.root.update()
-        messagebox.showinfo(APP_TITLE, "命令已复制")
+        messagebox.showinfo(APP_TITLE, "命令已复制。")
 
     def confirm_real_run(self) -> bool:
         mode = self.run_mode.get()
@@ -374,7 +652,7 @@ class LauncherGui:
 
 
 def main() -> None:
-    root = tk.Tk()
+    root = ctk.CTk()
     LauncherGui(root)
     root.mainloop()
 
