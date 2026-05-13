@@ -30,7 +30,7 @@ python -m pip install PyYAML
 python -m pip install customtkinter
 ```
 
-打包后的 EXE 已自带界面依赖，普通用户直接运行发布文件夹里的启动器即可，不需要单独安装 `customtkinter`。
+仅从源码运行现代化图形启动器时需要手动安装 `customtkinter`。如果发布文件夹中的 EXE 已使用当前现代化启动器重新打包，才会自带界面依赖；源码更新不等于 EXE 已重建，如果本次没有重新打包，应以源码运行或等待新版发布文件夹为准。
 
 4. 安装 WinRAR。
 
@@ -286,9 +286,9 @@ organizer_run_log.json
 
 正式执行前建议先备份当天待整理目录。
 
-## Windows exe v1.0 使用方式
+## Windows exe 使用方式
 
-1. 解压或打开 `Windows文件整理助手-v1.0` 文件夹。
+1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v1.1`。
 2. 双击 `Windows文件整理助手.exe`。
 3. `file_helper.py 路径` 默认会自动指向 exe 同目录下的 `file_helper.py`。
 4. `config.yaml 路径` 默认会自动指向 exe 同目录下的 `config.yaml`。
