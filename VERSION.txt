@@ -1,3 +1,3 @@
-v1.1
-release_date: 2026-05-09
+v1.2
+release_date: 2026-05-13
 name: Windows文件整理助手
