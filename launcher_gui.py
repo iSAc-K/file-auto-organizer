@@ -266,7 +266,6 @@ class LauncherGui:
             text=f"{title}\n{subtitle}",
             command=lambda: self.run_mode.set(value),
             anchor="w",
-            justify="left",
             height=58,
             fg_color="#1B2630",
             hover_color="#24313C",
@@ -620,6 +619,7 @@ class LauncherGui:
 
     def run_in_powershell(self) -> None:
         mode = self.run_mode.get()
+        settings_saved = False
         if mode in {"apply", "undo-last"}:
             if self.build_command() is None:
                 return
@@ -629,12 +629,13 @@ class LauncherGui:
             if not command:
                 return
             self.set_preview(command)
-            self.save_settings(show_message=False)
         else:
             command = self.generate_command()
+            settings_saved = command is not None
         if not command:
             return
-        self.save_settings(show_message=False)
+        if not settings_saved:
+            self.save_settings(show_message=False)
         try:
             subprocess.Popen(
                 [
