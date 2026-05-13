@@ -94,14 +94,17 @@ class LauncherCoreTests(unittest.TestCase):
                 open_result_folder=False,
             )
 
-            command = build_command(settings, include_yes=True)
+            normal_command = build_command(settings)
+            confirmed_command = build_command(settings, include_yes=True)
 
-        self.assertIn("--undo-last", command)
-        self.assertIn("--yes", command)
-        self.assertNotIn("--config", command)
-        self.assertNotIn("--archive", command)
-        self.assertNotIn("--apply", command)
-        self.assertNotIn("--dry-run", command)
+        self.assertIn("--undo-last", normal_command)
+        self.assertNotIn("--yes", normal_command)
+        self.assertIn("--yes", confirmed_command)
+        for command in (normal_command, confirmed_command):
+            self.assertNotIn("--config", command)
+            self.assertNotIn("--archive", command)
+            self.assertNotIn("--apply", command)
+            self.assertNotIn("--dry-run", command)
 
 
 if __name__ == "__main__":
