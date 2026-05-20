@@ -533,3 +533,15 @@ Before final response:
   or the EXE was rebuilt.
 - Do not trust stale memory for GitHub auth, branch, or release state; verify.
 
+## Windows Background Process Rule
+
+On Windows, do not attempt to launch persistent local web servers for preview.
+The Codex environment may terminate child Node processes immediately due to Job Object restrictions.
+
+Instead:
+1. Generate all source code.
+2. Provide exact commands for the user to run manually:
+   - npm install
+   - npm run dev
+3. If a preview is needed, generate a static HTML fallback.
+
