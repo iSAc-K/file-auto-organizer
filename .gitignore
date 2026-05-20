@@ -16,6 +16,7 @@ __pycache__/
 build/
 dist/
 *.spec
+Windows文件整理助手-v*/
 
 # Archives and customer/business files
 *.zip

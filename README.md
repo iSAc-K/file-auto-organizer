@@ -24,7 +24,15 @@ python -m pip install PyYAML
 
 如果没有 PyYAML，脚本也内置了一个简单 YAML 解析器，可以读取本项目默认配置。
 
-3. 安装 WinRAR。
+3. 如果要从源码运行现代化图形启动器，需要安装 CustomTkinter：
+
+```powershell
+python -m pip install customtkinter
+```
+
+仅从源码运行现代化图形启动器时需要手动安装 `customtkinter`。如果发布文件夹中的 EXE 已使用当前现代化启动器重新打包，才会自带界面依赖；源码更新不等于 EXE 已重建，如果本次没有重新打包，应以源码运行或等待新版发布文件夹为准。
+
+4. 安装 WinRAR。
 
 脚本优先查找并使用 `WinRAR.exe` 处理 zip、rar、7z。只有处理 rar 且找不到 WinRAR.exe 时，才尝试 `UnRAR.exe`。找不到可用解压工具时，会跳过当前压缩包并写入日志。
 
@@ -278,24 +286,26 @@ organizer_run_log.json
 
 正式执行前建议先备份当天待整理目录。
 
-## Windows exe v1.0 使用方式
+## Windows exe 使用方式
 
-1. 解压或打开 `Windows文件整理助手-v1.0` 文件夹。
+1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v1.2`。
 2. 双击 `Windows文件整理助手.exe`。
 3. `file_helper.py 路径` 默认会自动指向 exe 同目录下的 `file_helper.py`。
 4. `config.yaml 路径` 默认会自动指向 exe 同目录下的 `config.yaml`。
 5. 在 `要处理的文件夹路径` 中选择要处理的 root 文件夹。
-6. 先选择 `预览模式（--dry-run）` 并运行，确认计划不会做真实修改。
-7. 确认 dry-run 结果无误后，再选择 `执行模式（--apply）` 运行。
-8. apply 点击运行时会先弹窗确认；确认后启动器会通过 `--yes` 执行。
-9. `撤销上次整理（--undo-last）` 可以撤销最近一次 apply，并同样会先弹窗确认后通过 `--yes` 执行。
+6. 先使用默认选中的 `预览模式（--dry-run）` 并运行，确认计划不会做真实修改。
+7. 确认 dry-run 结果无误后，再切换到 `执行整理（--apply）` 运行。
+8. 执行整理点击运行时会先弹窗确认；确认后启动器会通过一次性 `--yes` 执行。
+9. `撤销上次（--undo-last）` 可以撤销最近一次 apply，并同样会先弹窗确认后通过一次性 `--yes` 执行。
 10. `organizer_run_log.json` 和 `rename_log.csv` 会生成在 root 目录中。
 11. `config.yaml` 可以手动编辑，用来增加品类关键词、合并规则和命名规则。
 12. 不要删除 `file_helper.py` 和 `config.yaml`，否则 exe 无法正常调用核心整理脚本和配置。
 
 ## 图形启动器 launcher_gui.py
 
-`launcher_gui.py` 是一个独立的 Windows 图形启动器，只负责选择路径、生成命令、复制命令，并通过 PowerShell 调用 `file_helper.py`。它不包含文件整理、分类、合并、重命名或压缩的核心逻辑。
+`launcher_gui.py` 是一个独立的 Windows 图形启动器，只负责选择路径、生成命令、复制命令，并通过隐藏的后台 PowerShell 调用 `file_helper.py`。它不包含文件整理、分类、合并、重命名或压缩的核心逻辑。
+
+新版启动器使用现代化 CustomTkinter 界面：左侧是模式导航，右侧是整理任务工作区。左侧用于切换 `预览模式`、`执行整理`、`撤销上次`，右侧用于填写 Python 命令、脚本路径、root 路径、config 路径，以及查看命令预览和运行状态。
 
 运行启动器：
 
@@ -308,15 +318,16 @@ py launcher_gui.py
 - 在 `file_helper.py 路径` 中选择本项目里的 `file_helper.py`。
 - 在 `要处理的文件夹路径` 中选择需要整理的根目录，也就是命令行里的 `--root`。
 - `config.yaml 路径` 可以选择本项目里的 `config.yaml`，也可以留空；留空时不会生成 `--config` 参数，由 `file_helper.py` 使用默认配置。
-- `预览模式（--dry-run）` 只生成和执行预览命令，不做真实修改。
-- `执行模式（--apply）` 会执行真实整理；点击运行时会先弹出确认框，确认后启动器自动追加 `--yes`，PowerShell 不再等待输入大写 `YES`。
-- `撤销上次整理（--undo-last）` 会生成撤销命令，不带 `--config`、`--dry-run`、`--apply` 或 `--archive`，并会禁用压缩选项。
+- 路径旁边会显示状态提示：`已找到` 表示路径存在，`未选择` 表示还没有填写，`路径不存在` 表示当前填写内容无效。
+- `预览模式` 对应 `--dry-run`，默认选中，只生成和执行预览命令，不做真实修改。
+- `执行整理` 对应 `--apply`，会执行真实整理；点击运行时会先弹出确认框，确认后启动器才自动追加一次性 `--yes`，PowerShell 不再等待输入大写 `YES`。
+- `撤销上次` 对应 `--undo-last`，会生成撤销命令，不使用 `config.yaml`，不带 `--config`、`--dry-run`、`--apply` 或 `--archive`，并会禁用压缩选项。
 - `整理完成后压缩最终文件夹` 只会在执行模式中追加 `--archive`。
 - `处理完成后打开结果目录` 会在脚本正常退出后用 PowerShell `Start-Process` 打开 root；脚本失败时不会自动打开。
-- 点击 `生成命令` 可以在预览框查看普通 PowerShell 命令；普通预览不会自动带 `--yes`。
-- 点击 `复制命令` 会重新生成普通命令并复制到剪贴板，不会复制一次性确认用的 `--yes`。
-- 点击 `在 PowerShell 中运行` 时，dry-run 直接运行；apply 和 undo-last 会先弹确认框，确认后才追加 `--yes` 并执行。窗口使用 `-NoExit -NoProfile -ExecutionPolicy Bypass`，不会自动关闭，方便查看输出。
+- 点击 `生成命令` 可以在预览框查看普通 PowerShell 命令；普通命令预览永远不带 `--yes`。
+- 点击 `复制命令` 会重新生成普通命令并复制到剪贴板；复制命令永远不带一次性确认用的 `--yes`。
+- 点击 `后台运行` 时，dry-run 会直接在后台运行；apply 和 undo-last 会先弹确认框，确认后才追加 `--yes` 并执行。启动器不会显示 PowerShell 窗口，输出会追加写入启动器同目录的 `launcher_run_output.log`，任务结束后会弹窗提示成功或失败。
 - 点击 `保存设置` 会把当前路径和选项保存到 `launcher_gui.py` 同目录的 `launcher_settings.json`。
 - 点击 `清空已保存路径` 会删除或重置保存的路径和选项。
 
-启动器会记住 Python 命令、`file_helper.py` 路径、root 路径、config 路径、运行模式、压缩勾选状态和打开结果目录勾选状态。`launcher_settings.json` 只保存这些路径和 UI 选项，不保存客户文件内容；如果 JSON 损坏，启动器会弹窗提示并使用默认值。
+启动器只会记住 Python 命令、`file_helper.py` 路径、root 路径、config 路径、运行模式、压缩勾选状态和打开结果目录勾选状态。`launcher_settings.json` 只保存这些路径和 UI 选项，不保存客户文件内容；如果 JSON 损坏，启动器会弹窗提示并使用默认值。
