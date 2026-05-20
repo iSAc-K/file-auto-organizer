@@ -288,7 +288,7 @@ organizer_run_log.json
 
 ## Windows exe 使用方式
 
-1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v1.2`。
+1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v2.0`。
 2. 双击 `Windows文件整理助手.exe`。
 3. `file_helper.py 路径` 默认会自动指向 exe 同目录下的 `file_helper.py`。
 4. `config.yaml 路径` 默认会自动指向 exe 同目录下的 `config.yaml`。
