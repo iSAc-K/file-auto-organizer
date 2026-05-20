@@ -303,7 +303,7 @@ organizer_run_log.json
 
 ## 图形启动器 launcher_gui.py
 
-`launcher_gui.py` 是一个独立的 Windows 图形启动器，只负责选择路径、生成命令、复制命令，并通过 PowerShell 调用 `file_helper.py`。它不包含文件整理、分类、合并、重命名或压缩的核心逻辑。
+`launcher_gui.py` 是一个独立的 Windows 图形启动器，只负责选择路径、生成命令、复制命令，并通过隐藏的后台 PowerShell 调用 `file_helper.py`。它不包含文件整理、分类、合并、重命名或压缩的核心逻辑。
 
 新版启动器使用现代化 CustomTkinter 界面：左侧是模式导航，右侧是整理任务工作区。左侧用于切换 `预览模式`、`执行整理`、`撤销上次`，右侧用于填写 Python 命令、脚本路径、root 路径、config 路径，以及查看命令预览和运行状态。
 
@@ -326,7 +326,7 @@ py launcher_gui.py
 - `处理完成后打开结果目录` 会在脚本正常退出后用 PowerShell `Start-Process` 打开 root；脚本失败时不会自动打开。
 - 点击 `生成命令` 可以在预览框查看普通 PowerShell 命令；普通命令预览永远不带 `--yes`。
 - 点击 `复制命令` 会重新生成普通命令并复制到剪贴板；复制命令永远不带一次性确认用的 `--yes`。
-- 点击 `在 PowerShell 中运行` 时，dry-run 直接运行；apply 和 undo-last 会先弹确认框，确认后才追加 `--yes` 并执行。窗口使用 `-NoExit -NoProfile -ExecutionPolicy Bypass`，不会自动关闭，方便查看输出。
+- 点击 `后台运行` 时，dry-run 会直接在后台运行；apply 和 undo-last 会先弹确认框，确认后才追加 `--yes` 并执行。启动器不会显示 PowerShell 窗口，输出会追加写入启动器同目录的 `launcher_run_output.log`，任务结束后会弹窗提示成功或失败。
 - 点击 `保存设置` 会把当前路径和选项保存到 `launcher_gui.py` 同目录的 `launcher_settings.json`。
 - 点击 `清空已保存路径` 会删除或重置保存的路径和选项。
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import threading
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -21,6 +24,7 @@ from launcher_core import (
 
 
 APP_TITLE = "Windows 文件整理助手"
+LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 
 MODE_LABELS = {
     "dry-run": "预览模式",
@@ -463,7 +467,7 @@ class LauncherGui:
         ).grid(row=0, column=2, padx=(0, 10))
         ctk.CTkButton(
             bar,
-            text="在 PowerShell 中运行",
+            text="后台运行",
             command=self.run_in_powershell,
             fg_color="#F05A28",
             hover_color="#C84418",
@@ -636,20 +640,75 @@ class LauncherGui:
             return
         if not settings_saved:
             self.save_settings(show_message=False)
+        log_path = self.base_dir / LAUNCHER_OUTPUT_LOG
         try:
-            subprocess.Popen(
-                [
-                    "powershell.exe",
-                    "-NoExit",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    command,
-                ]
+            thread = threading.Thread(
+                target=self.run_hidden_powershell,
+                args=(command, log_path),
+                daemon=True,
+            )
+            thread.start()
+            messagebox.showinfo(
+                APP_TITLE,
+                f"已在后台启动，不会显示 PowerShell 窗口。\n输出日志：\n{log_path}",
             )
         except OSError as exc:
-            messagebox.showerror(APP_TITLE, f"无法启动 PowerShell：\n{exc}")
+            messagebox.showerror(APP_TITLE, f"无法启动后台任务：\n{exc}")
+
+    def run_hidden_powershell(self, command: str, log_path: Path) -> None:
+        started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
+                log_file.write(f"\n[{started_at}] 启动后台 PowerShell\n")
+                log_file.write(f"命令：{command}\n")
+                log_file.flush()
+                powershell_command = (
+                    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                    "$OutputEncoding = [Console]::OutputEncoding; "
+                    f"{command}"
+                )
+                env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+                proc = subprocess.Popen(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        powershell_command,
+                    ],
+                    cwd=str(self.base_dir),
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    creationflags=creationflags,
+                )
+                return_code = proc.wait()
+                finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                log_file.write(f"\n[{finished_at}] 后台任务结束，退出码：{return_code}\n")
+        except Exception as exc:
+            error_message = str(exc)
+            self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"后台任务运行失败：\n{error_message}"))
+            return
+
+        if return_code == 0:
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo(
+                    APP_TITLE,
+                    f"后台任务已完成。\n输出日志：\n{log_path}",
+                ),
+            )
+        else:
+            self.root.after(
+                0,
+                lambda: messagebox.showerror(
+                    APP_TITLE,
+                    f"后台任务失败，退出码：{return_code}\n请查看日志：\n{log_path}",
+                ),
+            )
 
 
 def main() -> None:
