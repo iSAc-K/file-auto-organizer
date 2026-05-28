@@ -286,6 +286,16 @@ organizer_run_log.json
 
 正式执行前建议先备份当天待整理目录。
 
+## 发布包同步检查
+
+如果源码里的 `file_helper.py`、`config.yaml`、`README.md` 或 `VERSION.txt` 改过，但发布文件夹没有同步，EXE 旁边的外置脚本和配置可能仍是旧版本。发布前可以运行检查命令：
+
+```powershell
+python tools/check_release_sync.py --release ".\Windows文件整理助手-v2.0"
+```
+
+这个命令只检查，不会复制、覆盖或修改发布文件夹。检查结果会显示每个文件是 `一致`、`缺失发布文件`、`缺失源码文件` 或 `不一致`。全部一致时返回码为 `0`；只要有缺失或不一致，返回码为 `1`。
+
 ## Windows exe 使用方式
 
 1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v2.0`。
