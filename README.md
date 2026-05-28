@@ -271,6 +271,18 @@ organizer_run_log.json
 
 真实执行和撤销会额外写一行 `confirm` 日志，在 `error_message` 中记录 `confirmation_method=cli_yes` 或 `confirmation_method=arg_yes`，方便区分是命令行手动输入还是参数确认。
 
+## 整理报告
+
+每次 `--dry-run` 或 `--apply` 结束后，会在本次 root 目录生成：
+
+```text
+整理报告.xlsx
+```
+
+dry-run 报告显示计划结果，apply 报告显示实际结果。报告字段包括原始路径、目标路径、识别日期、识别品类、命中关键词、单量、数量、是否合并、是否跳过、跳过原因、是否压缩、压缩状态、undo 支持和备注。
+
+报告中的跳过原因会尽量细分，例如 `未识别品类`、`未识别日期`、`未识别单量`、`未识别数量`、`命中禁止合并关键词`、`已处理格式`、`目标冲突`、`压缩包冲突`。报告生成失败时会打印警告并写入日志，不会回滚或破坏已经完成的整理操作。
+
 ## 出错排查
 
 先看命令行输出，再打开 `rename_log.csv`。常见问题：
@@ -291,10 +303,30 @@ organizer_run_log.json
 如果源码里的 `file_helper.py`、`config.yaml`、`README.md` 或 `VERSION.txt` 改过，但发布文件夹没有同步，EXE 旁边的外置脚本和配置可能仍是旧版本。发布前可以运行检查命令：
 
 ```powershell
-python tools/check_release_sync.py --release ".\Windows文件整理助手-v2.0"
+python tools/check_release_sync.py --release ".\Windows文件整理助手-v1.2"
 ```
 
-这个命令只检查，不会复制、覆盖或修改发布文件夹。检查结果会显示每个文件是 `一致`、`缺失发布文件`、`缺失源码文件` 或 `不一致`。全部一致时返回码为 `0`；只要有缺失或不一致，返回码为 `1`。
+这个命令只检查，不会复制、覆盖或修改发布文件夹。检查结果会显示每个文件是 `一致`、`缺失` 或 `不一致`。全部一致时返回码为 `0`；只要有缺失或不一致，返回码为 `1`。
+
+## 规则验证与诊断
+
+检查 `config.yaml` 是否能正常读取、模板是否有效、关键词是否重复、关键词是否存在包含关系、`category_priority` 是否和品类列表一致：
+
+```powershell
+python file_helper.py check-config --config config.yaml
+```
+
+`check-config` 只检查配置，不会修改配置或移动任何文件。输出会区分 `[OK]`、`[WARN]`、`[ERROR]`；警告不一定导致失败，存在错误时返回码为 `1`。
+
+测试单个文件夹名或压缩包外层名的识别结果：
+
+```powershell
+python file_helper.py test-name "0507-WZY-钢片军牌钥匙扣-13单18个" --config config.yaml
+```
+
+`test-name` 只分析输入名称，不扫描目录、不移动文件、不重命名、不压缩、不生成 undo 日志。它会显示识别日期、品类、命中关键词、单量、数量、禁止合并关键词、排序优先级、是否已处理格式、建议输出名和诊断信息。
+
+关键词包含关系通常是 `[WARN]`，因为当前项目采用最长关键词优先；例如同时存在 `钥匙扣` 和 `钢片军牌钥匙扣` 时，会优先匹配更长的 `钢片军牌钥匙扣`。完全重复关键词需要人工检查，尤其是同一个关键词出现在多个品类中时。
 
 ## Windows exe 使用方式
 

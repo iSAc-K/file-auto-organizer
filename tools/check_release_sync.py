@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import argparse
-import filecmp
+import hashlib
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -37,19 +37,27 @@ def check_files(source_root: Path, release_root: Path, files: Iterable[str]) -> 
         source_path = source_root / relative
         release_path = release_root / relative
         if not source_path.exists() or not source_path.is_file():
-            lines.append(f"缺失源码文件: {relative}")
+            lines.append(f"{relative}\t缺失")
             issue_count += 1
             continue
         if not release_path.exists() or not release_path.is_file():
-            lines.append(f"缺失发布文件: {relative}")
+            lines.append(f"{relative}\t缺失")
             issue_count += 1
             continue
-        if filecmp.cmp(source_path, release_path, shallow=False):
-            lines.append(f"一致: {relative}")
+        if sha256_file(source_path) == sha256_file(release_path):
+            lines.append(f"{relative}\t一致")
         else:
-            lines.append(f"不一致: {relative}")
+            lines.append(f"{relative}\t不一致")
             issue_count += 1
     return issue_count, lines
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

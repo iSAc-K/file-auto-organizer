@@ -22,9 +22,9 @@ class CheckReleaseSyncTests(unittest.TestCase):
             issue_count, lines = check_files(source, release, ["same.txt", "different.txt", "missing.txt"])
 
         self.assertEqual(issue_count, 2)
-        self.assertIn("一致: same.txt", lines)
-        self.assertIn("不一致: different.txt", lines)
-        self.assertIn("缺失发布文件: missing.txt", lines)
+        self.assertIn("same.txt\t一致", lines)
+        self.assertIn("different.txt\t不一致", lines)
+        self.assertIn("missing.txt\t缺失", lines)
 
 
 if __name__ == "__main__":

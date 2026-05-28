@@ -17,10 +17,12 @@ import re
 import shutil
 import string
 import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from xml.sax.saxutils import escape
 
 try:
     import yaml
@@ -31,6 +33,7 @@ except ImportError:  # PyYAML is recommended, but the default config has a fallb
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 RUN_LOG_NAME = "organizer_run_log.json"
 RUN_LOG_TMP_NAME = "organizer_run_log.json.tmp"
+REPORT_NAME = "整理报告.xlsx"
 UNDOABLE_RUN_STATUSES = {"success", "partial"}
 WINDOWS_ILLEGAL_CHARS = r'\/:*?"<>|'
 SYSTEM_FOLDER_NAMES = {"__pycache__", ".git", ".hg", ".svn", ".venv", "venv", "env"}
@@ -59,6 +62,22 @@ LOG_FIELDS = [
     "merge_enabled",
     "status",
     "error_message",
+]
+REPORT_FIELDS = [
+    "原始路径",
+    "目标路径",
+    "识别日期",
+    "识别品类",
+    "命中关键词",
+    "单量",
+    "数量",
+    "是否合并",
+    "是否跳过",
+    "跳过原因",
+    "是否压缩",
+    "压缩状态",
+    "undo支持",
+    "备注",
 ]
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -168,6 +187,17 @@ class PlanGroup:
     final_name: str
     target_path: Path
     naming_template: str
+    reason: str
+
+
+@dataclass
+class CategoryExplanation:
+    category: str
+    matched_keyword: str
+    matched_keywords: List[str]
+    match_strategy: str
+    priority: Optional[int]
+    merge_enabled: bool
     reason: str
 
 
@@ -335,6 +365,166 @@ def validate_config(config: Dict[str, Any]) -> None:
     validate_template("inner_folder_naming.template", config["inner_folder_naming"]["template"], inner_allowed)
 
 
+def loaded_config_text(config_path: Path) -> str:
+    if not config_path.exists():
+        raise ConfigError(f"config.yaml 不存在：{config_path}")
+    return config_path.read_text(encoding="utf-8").lstrip("\ufeff")
+
+
+def load_raw_config(config_path: Path) -> Dict[str, Any]:
+    text = loaded_config_text(config_path)
+    try:
+        loaded = simple_yaml_load(text) if yaml is None else (yaml.safe_load(text) or {})
+    except Exception as exc:
+        raise ConfigError(f"config.yaml 读取失败：{exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ConfigError("config.yaml 顶层必须是字典。")
+    return loaded
+
+
+def duplicate_category_names_from_text(text: str) -> List[str]:
+    in_categories = False
+    category_indent: Optional[int] = None
+    seen: Dict[str, int] = {}
+    duplicates: List[str] = []
+    for original in text.splitlines():
+        stripped = original.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(original) - len(original.lstrip(" "))
+        if indent == 0:
+            in_categories = stripped == "categories:"
+            category_indent = None
+            continue
+        if not in_categories or ":" not in stripped:
+            continue
+        if category_indent is None:
+            category_indent = indent
+        if indent != category_indent:
+            continue
+        name = stripped.split(":", 1)[0].strip().strip('"').strip("'")
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] == 2:
+            duplicates.append(name)
+    return duplicates
+
+
+def keyword_entries(config: Dict[str, Any]) -> List[Tuple[str, str, int]]:
+    entries: List[Tuple[str, str, int]] = []
+    categories = config.get("categories", {})
+    if not isinstance(categories, dict):
+        return entries
+    for category, data in categories.items():
+        if not isinstance(data, dict):
+            continue
+        for index, keyword in enumerate(data.get("keywords", []) or []):
+            entries.append((str(category), str(keyword), index))
+    return entries
+
+
+def analyze_keyword_conflicts(config: Dict[str, Any]) -> List[Tuple[str, str]]:
+    diagnostics: List[Tuple[str, str]] = []
+    entries = keyword_entries(config)
+    by_keyword: Dict[str, List[Tuple[str, str, int]]] = {}
+    by_category_keyword: Dict[Tuple[str, str], int] = {}
+    for category, keyword, index in entries:
+        folded = keyword.casefold()
+        by_keyword.setdefault(folded, []).append((category, keyword, index))
+        key = (category, folded)
+        by_category_keyword[key] = by_category_keyword.get(key, 0) + 1
+
+    for (category, folded), count in sorted(by_category_keyword.items()):
+        if count > 1:
+            keyword = next(keyword for cat, keyword, _ in entries if cat == category and keyword.casefold() == folded)
+            diagnostics.append(("WARN", f"同一分类内部重复关键词：{category} / {keyword}"))
+
+    for matches in by_keyword.values():
+        categories = sorted({category for category, _keyword, _index in matches})
+        if len(categories) > 1:
+            keyword = matches[0][1]
+            diagnostics.append(("ERROR", f"重复关键词：{keyword} 同时出现在 {', '.join(categories)}"))
+
+    unique_keywords = sorted({keyword for _category, keyword, _index in entries}, key=lambda value: (len(value), value.casefold()))
+    for short in unique_keywords:
+        if not short:
+            continue
+        for long in unique_keywords:
+            if short == long or len(short) >= len(long):
+                continue
+            if short.casefold() in long.casefold():
+                diagnostics.append(("WARN", f"关键词包含关系：{short} 被 {long} 包含"))
+                diagnostics.append(("INFO", f"当前策略：最长关键词优先，因此将优先匹配 {long}"))
+    return diagnostics
+
+
+def check_config_diagnostics(config_path: Path) -> Tuple[int, List[Tuple[str, str]]]:
+    diagnostics: List[Tuple[str, str]] = []
+    try:
+        text = loaded_config_text(config_path)
+        raw = load_raw_config(config_path)
+        config = load_config(config_path)
+    except Exception as exc:
+        return 1, [("ERROR", str(exc))]
+
+    required = [
+        "category_priority",
+        "categories",
+        "do_not_merge_keywords",
+        "naming",
+        "inner_folder_naming",
+        "sequence",
+        "quantity_detection",
+        "conflict",
+        "already_processed",
+        "fallback",
+    ]
+    for key in required:
+        if key not in raw:
+            diagnostics.append(("ERROR", f"缺少必需配置项：{key}"))
+
+    duplicates = duplicate_category_names_from_text(text)
+    for category in duplicates:
+        diagnostics.append(("ERROR", f"重复品类名：{category}"))
+
+    try:
+        validate_config(config)
+        diagnostics.append(("OK", "config.yaml 可以正常读取并通过基础校验"))
+    except Exception as exc:
+        diagnostics.append(("ERROR", str(exc)))
+
+    categories = config.get("categories", {})
+    if not isinstance(categories, dict):
+        diagnostics.append(("ERROR", "categories 必须是字典。"))
+        categories = {}
+    if not categories:
+        diagnostics.append(("ERROR", "categories 为空，无法识别任何品类"))
+    priority = [str(item) for item in config.get("category_priority", []) or []]
+    category_names = [str(item) for item in categories.keys()]
+    missing_priority = sorted(set(category_names) - set(priority))
+    for category in missing_priority:
+        diagnostics.append(("WARN", f"category_priority 缺失已配置品类：{category}"))
+    unknown_priority = sorted(set(priority) - set(category_names))
+    for category in unknown_priority:
+        diagnostics.append(("WARN", f"category_priority 包含不存在的品类：{category}"))
+    if not config.get("do_not_merge_keywords", []):
+        diagnostics.append(("WARN", "do_not_merge_keywords 为空，当前没有强制不合并关键词"))
+
+    diagnostics.extend(analyze_keyword_conflicts(config))
+    return 1 if any(level == "ERROR" for level, _message in diagnostics) else 0, diagnostics
+
+
+def command_check_config(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(description="检查 config.yaml 规则配置")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="配置文件路径")
+    args = parser.parse_args(argv)
+    exit_code, diagnostics = check_config_diagnostics(Path(args.config).expanduser().resolve())
+    print("========== 配置检查 ==========")
+    for level, message in diagnostics:
+        print(f"[{level}] {message}")
+    print("检查结果：存在错误。" if exit_code else "检查结果：没有错误。")
+    return exit_code
+
+
 def write_log(log_path: Path, row: Dict[str, Any]) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     exists = log_path.exists()
@@ -434,6 +624,9 @@ def log_item(
     target_path: Optional[Path] = None,
 ) -> None:
     det = item.detection if item else Detection()
+    source_detail = "; ".join(det.quantity_sources or det.category_sources or det.date_sources)
+    if item:
+        source_detail = "; ".join(part for part in [source_detail, f"matched_keyword={det.matched_keyword}" if det.matched_keyword else ""] if part)
     write_log(
         log_path,
         {
@@ -448,7 +641,7 @@ def log_item(
             "detected_category": det.category,
             "detected_orders": det.orders,
             "detected_quantity": det.quantity,
-            "source_name": "; ".join(det.quantity_sources or det.category_sources or det.date_sources),
+            "source_name": source_detail,
             "naming_template": group.naming_template if group else (item.naming_template if item else ""),
             "merge_enabled": str(det.merge_enabled).lower() if item else "",
             "status": status,
@@ -516,6 +709,254 @@ def log_group_zip(
             source_path=group.target_path,
             target_path=zip_path_for_folder(group.target_path),
         )
+
+
+def detail_reason(message: str) -> str:
+    if not message:
+        return ""
+    checks = [
+        ("目标目录已存在", "目标冲突"),
+        ("解压目标文件夹已存在", "目标冲突"),
+        ("同名 zip 已存在", "压缩包冲突"),
+        ("可能已经整理过", "已处理格式"),
+        ("已生成的合并目标目录", "已处理格式"),
+        ("回退目标已存在", "undo源路径已存在"),
+        ("撤销来源不存在", "undo目标路径不存在"),
+        ("config.yaml", "配置错误"),
+        ("配置", "配置错误"),
+    ]
+    for needle, reason in checks:
+        if needle in message:
+            return reason
+    return message
+
+
+def recognition_reasons(item: WorkItem, config: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    unknown_category = config["fallback"]["unknown_category"]
+    if item.detection.category == unknown_category:
+        reasons.append("未识别品类")
+    if not item.detection.dates:
+        reasons.append("未识别日期")
+    if item.detection.quantity_source_label == "fallback":
+        reasons.extend(["未识别单量", "未识别数量"])
+    if item.detection.do_not_merge_hits:
+        reasons.append(f"命中禁止合并关键词：{', '.join(item.detection.do_not_merge_hits)}")
+    return reasons
+
+
+def group_target_conflicts(group: PlanGroup) -> bool:
+    if not group.target_path.exists():
+        return False
+    return not any(item.current_path == group.target_path for item in group.items)
+
+
+def report_cell_ref(column_index: int, row_index: int) -> str:
+    letters = ""
+    value = column_index
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return f"{letters}{row_index}"
+
+
+def xlsx_sheet_xml(rows: List[List[Any]]) -> str:
+    lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
+    lines.append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">')
+    lines.append("<sheetData>")
+    for row_index, row in enumerate(rows, start=1):
+        lines.append(f'<row r="{row_index}">')
+        for column_index, value in enumerate(row, start=1):
+            cell_ref = report_cell_ref(column_index, row_index)
+            text = escape(str(value if value is not None else ""))
+            lines.append(f'<c r="{cell_ref}" t="inlineStr"><is><t>{text}</t></is></c>')
+        lines.append("</row>")
+    lines.append("</sheetData>")
+    lines.append("</worksheet>")
+    return "\n".join(lines)
+
+
+def write_xlsx(path: Path, rows: List[List[Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>""",
+        )
+        zf.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""",
+        )
+        zf.writestr(
+            "xl/workbook.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="整理报告" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>""",
+        )
+        zf.writestr(
+            "xl/_rels/workbook.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>""",
+        )
+        zf.writestr("xl/worksheets/sheet1.xml", xlsx_sheet_xml(rows))
+
+
+def next_report_path(root: Path) -> Path:
+    base = root / REPORT_NAME
+    if not base.exists():
+        return base
+    stem = base.stem
+    suffix = base.suffix
+    for index in range(1, 1000):
+        candidate = root / f"{stem}-{index:03d}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"无法生成不冲突的整理报告路径：{base}")
+
+
+def compression_plan_status(group: PlanGroup, archive_enabled: bool, mode: str, compression_status: Dict[str, str]) -> Tuple[str, str]:
+    if not archive_enabled:
+        return "否", "未启用"
+    key = absolute_text(group.target_path)
+    if key in compression_status:
+        status = compression_status[key]
+        return ("是" if status == "已压缩" else "否"), status
+    zip_path = zip_path_for_folder(group.target_path)
+    if group_target_conflicts(group):
+        return "否", "未压缩：目标冲突"
+    if zip_path.exists():
+        return "是", "压缩包冲突"
+    if mode == "dry-run":
+        return "是", "计划压缩"
+    return "是", "未执行"
+
+
+def build_report_rows(
+    root: Path,
+    items: List[WorkItem],
+    groups: List[PlanGroup],
+    mode: str,
+    archive_enabled: bool,
+    config: Optional[Dict[str, Any]] = None,
+    completed_groups: Optional[List[PlanGroup]] = None,
+    compression_status: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    config = config or DEFAULT_CONFIG
+    compression_status = compression_status or {}
+    completed_group_ids = {id(group) for group in completed_groups or []}
+    group_by_item = {id(item): group for group in groups for item in group.items}
+    rows: List[Dict[str, Any]] = []
+    for item in sorted(items, key=lambda it: (it.sequence_number is None, it.sequence_number or 999999, it.original_name.casefold())):
+        group = group_by_item.get(id(item))
+        target_path = group.target_path if group else item.final_path
+        reason_parts = recognition_reasons(item, config)
+        is_skip = bool(item.skip_reason)
+        if item.skip_reason:
+            reason_parts.append(detail_reason(item.skip_reason))
+        if group and group_target_conflicts(group):
+            is_skip = True
+            reason_parts.append("目标冲突")
+        if group and mode == "apply" and completed_groups is not None and id(group) not in completed_group_ids:
+            is_skip = True
+            if "目标冲突" not in reason_parts:
+                reason_parts.append("执行未完成或已跳过")
+        if item.skip_reason and not reason_parts:
+            reason_parts.append(item.skip_reason)
+        compressed, compress_status = compression_plan_status(group, archive_enabled, mode, compression_status) if group else ("否", "未生成整理计划")
+        undo_supported = "是" if mode == "apply" and group and id(group) in completed_group_ids else ("计划支持" if mode == "dry-run" and group and not is_skip else "否")
+        rows.append(
+            {
+                "原始路径": absolute_text(item.current_path),
+                "目标路径": absolute_text(target_path) if target_path else "",
+                "识别日期": item.detection.date_label,
+                "识别品类": item.detection.category,
+                "命中关键词": item.detection.matched_keyword,
+                "单量": item.detection.orders,
+                "数量": item.detection.quantity,
+                "是否合并": "是" if group and group.is_merge else "否",
+                "是否跳过": "是" if is_skip else "否",
+                "跳过原因": "；".join(dict.fromkeys(part for part in reason_parts if part)),
+                "是否压缩": compressed,
+                "压缩状态": compress_status,
+                "undo支持": undo_supported,
+                "备注": "计划执行" if mode == "dry-run" else "实际结果",
+            }
+        )
+    return rows
+
+
+def write_organize_report(
+    root: Path,
+    items: List[WorkItem],
+    groups: List[PlanGroup],
+    mode: str,
+    archive_enabled: bool = False,
+    config: Optional[Dict[str, Any]] = None,
+    completed_groups: Optional[List[PlanGroup]] = None,
+    compression_status: Optional[Dict[str, str]] = None,
+) -> Path:
+    report_path = next_report_path(root)
+    report_rows = build_report_rows(root, items, groups, mode, archive_enabled, config, completed_groups, compression_status)
+    rows = [REPORT_FIELDS]
+    rows.extend([[row.get(field, "") for field in REPORT_FIELDS] for row in report_rows])
+    write_xlsx(report_path, rows)
+    return report_path
+
+
+def safe_write_organize_report(
+    root: Path,
+    items: List[WorkItem],
+    groups: List[PlanGroup],
+    mode: str,
+    log_path: Path,
+    archive_enabled: bool = False,
+    config: Optional[Dict[str, Any]] = None,
+    completed_groups: Optional[List[PlanGroup]] = None,
+    compression_status: Optional[Dict[str, str]] = None,
+) -> Optional[Path]:
+    try:
+        report_path = write_organize_report(root, items, groups, mode, archive_enabled, config, completed_groups, compression_status)
+        print(f"整理报告已写入：{report_path}")
+        return report_path
+    except Exception as exc:
+        message = f"整理报告生成失败：{exc}"
+        print(f"警告：{message}")
+        write_log(log_path, {"time": now_text(), "mode": mode, "action": "report", "status": "failed", "error_message": message})
+        return None
+
+
+def print_item_diagnostic(item: WorkItem, config: Dict[str, Any]) -> None:
+    if item.skip_reason:
+        print(f"[跳过] {item.original_name}")
+        print(f"  原因={detail_reason(item.skip_reason)}")
+        return
+    explanation = explain_category(item.original_name, config)
+    det = item.detection
+    print(f"[识别] {item.original_name}")
+    print(f"  品类={det.category}")
+    print(f"  关键词={det.matched_keyword or '未命中'}")
+    print(f"  日期={det.date_label}")
+    print(f"  单量={det.orders}")
+    print(f"  数量={det.quantity}")
+    print(f"  策略={explanation.match_strategy}")
+    if det.do_not_merge_hits:
+        print(f"[警告] {item.original_name}")
+        print(f"  原因=命中禁止合并关键词：{', '.join(det.do_not_merge_hits)}")
+        print("  行为=识别、排序、编号，但不进入自动合并")
 
 
 def find_executable(names: Sequence[str], extra_paths: Sequence[Path]) -> Optional[Path]:
@@ -769,16 +1210,41 @@ def detect_dates(original_name: str, unknown: str) -> Tuple[List[str], str, List
     return unique, f"{unique[0]}-{unique[-1]}", sources
 
 
-def detect_category(original_name: str, config: Dict[str, Any]) -> Tuple[str, str, bool, List[str]]:
-    best: Tuple[int, str, str, bool, str] = (0, "", "", False, "")
+def explain_category(original_name: str, config: Dict[str, Any]) -> CategoryExplanation:
+    matches: List[Tuple[int, str, str, bool]] = []
     for category, data in config.get("categories", {}).items():
         for keyword in data.get("keywords", []) or []:
             kw = str(keyword)
-            if kw.casefold() in original_name.casefold() and len(kw) > best[0]:
-                best = (len(kw), category, kw, bool(data.get("merge_enabled", False)), "outer_folder_name_only")
-    if best[1]:
-        return best[1], best[2], best[3], [best[4]]
-    return config["fallback"]["unknown_category"], "", False, []
+            if kw.casefold() in original_name.casefold():
+                matches.append((len(kw), category, kw, bool(data.get("merge_enabled", False))))
+    if matches:
+        _length, category, keyword, merge_enabled = sorted(matches, key=lambda item: (-item[0], item[2].casefold()))[0]
+        priority = category_priority_index(category, config)
+        return CategoryExplanation(
+            category=category,
+            matched_keyword=keyword,
+            matched_keywords=[match[2] for match in sorted(matches, key=lambda item: (-item[0], item[2].casefold()))],
+            match_strategy="longest_keyword_first",
+            priority=priority,
+            merge_enabled=merge_enabled,
+            reason=f"命中关键词：{keyword}；采用最长关键词优先",
+        )
+    unknown = config["fallback"]["unknown_category"]
+    return CategoryExplanation(
+        category=unknown,
+        matched_keyword="",
+        matched_keywords=[],
+        match_strategy="longest_keyword_first",
+        priority=category_priority_index(unknown, config),
+        merge_enabled=False,
+        reason="未命中任何品类关键词",
+    )
+
+
+def detect_category(original_name: str, config: Dict[str, Any]) -> Tuple[str, str, bool, List[str]]:
+    explanation = explain_category(original_name, config)
+    sources = ["outer_folder_name_only"] if explanation.matched_keyword else []
+    return explanation.category, explanation.matched_keyword, explanation.merge_enabled, sources
 
 
 def detect_orders_quantity(
@@ -826,6 +1292,59 @@ def scan_and_detect(item: WorkItem, config: Dict[str, Any]) -> None:
     detection.ignored_quantity_sources = ignored_quantity_sources
     detection.do_not_merge_hits = detect_do_not_merge(item.original_name, config)
     item.detection = detection
+
+
+def analyze_name(name: str, config: Dict[str, Any]) -> Tuple[WorkItem, CategoryExplanation]:
+    item = WorkItem("name", name, Path(name), Path("."))
+    scan_and_detect(item, config)
+    return item, explain_category(name, config)
+
+
+def command_test_name(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(description="测试单个文件夹名的识别结果")
+    parser.add_argument("name", help="要测试的文件夹名或压缩包外层名")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="配置文件路径")
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(Path(args.config).expanduser().resolve())
+        validate_config(config)
+        item, explanation = analyze_name(args.name, config)
+    except Exception as exc:
+        print(f"[ERROR] 配置错误：{exc}")
+        return 1
+
+    det = item.detection
+    already_processed = is_generated_merge_folder_name(args.name) or is_already_processed(args.name, config)
+    priority_text = "未配置" if explanation.priority is None else str(explanation.priority + 1)
+    print(f"输入名称：{args.name}")
+    print("\n识别结果：")
+    print(f"  日期：{det.date_label}")
+    print(f"  品类：{det.category}")
+    print(f"  命中关键词：{det.matched_keyword or '未命中'}")
+    print(f"  单量：{det.orders}")
+    print(f"  数量：{det.quantity}")
+    print(f"  禁止合并：{'是' if det.do_not_merge_hits else '否'}")
+    print(f"  禁止合并关键词：{', '.join(det.do_not_merge_hits) if det.do_not_merge_hits else '无'}")
+    print(f"  排序优先级：{priority_text}")
+    print(f"  已处理格式：{'是' if already_processed else '否'}")
+    print(f"  建议输出名：{render_group([item], False, config, Path('.'), '测试名称').final_name if item.sequence_number is not None else render_template(config['naming']['single_template'], {'seq': 1, 'seq_range': '1', 'date': det.date_label, 'category': det.category, 'orders': det.orders, 'quantity': det.quantity, 'original_name': item.original_name, 'clean_original_name': item.clean_original_name or item.original_name, 'custom_text': config.get('naming', {}).get('custom_text', ''), 'merge_name': config.get('naming', {}).get('merge_name', det.category)})}")
+    print("\n识别来源：")
+    print(f"  日期来源：{'输入名称' if det.date_sources else 'fallback'}")
+    print(f"  品类来源：{'输入名称' if det.category_sources else '未命中'}")
+    print(f"  单量来源：{'输入名称' if det.quantity_source_label != 'fallback' else 'fallback'}")
+    print(f"  数量来源：{'输入名称' if det.quantity_source_label != 'fallback' else 'fallback'}")
+    print("\n诊断：")
+    print(f"  {explanation.reason}")
+    print(f"  策略：{explanation.match_strategy}")
+    if explanation.matched_keywords:
+        print(f"  所有命中关键词：{', '.join(explanation.matched_keywords)}")
+    if det.do_not_merge_hits:
+        print(f"  命中禁止合并关键词：{', '.join(det.do_not_merge_hits)}；行为=识别、排序、编号，但不进入自动合并")
+    else:
+        print("  未发现禁止合并关键词")
+    if already_processed:
+        print("  已处理格式：将被整理流程跳过")
+    return 0
 
 
 def safe_folder_name(name: str) -> str:
@@ -985,6 +1504,7 @@ def build_plan(root: Path, config: Dict[str, Any], mode: str, log_path: Path, ar
                 scan_and_detect(item, config)
             except Exception as exc:
                 item.skip_reason = f"扫描识别失败：{exc}"
+        print_item_diagnostic(item, config)
         if log_dry_run:
             log_item(log_path, mode, "plan_scan", item, status="skipped" if item.skip_reason else "success", error_message=item.skip_reason)
 
@@ -1072,6 +1592,9 @@ def print_plan(root: Path, config: Dict[str, Any], items: List[WorkItem], groups
         print(f"  品类排序：{category_priority_label(item, config)}")
         print(f"  分配序号：{item.sequence_number}")
         print(f"  merge_enabled: {str(det.merge_enabled).lower()}")
+        specific_reasons = recognition_reasons(item, config)
+        if specific_reasons:
+            print(f"  识别/处理原因：{'；'.join(specific_reasons)}")
         if det.do_not_merge_hits:
             print(f"  强制不合并命中：{', '.join(det.do_not_merge_hits)}")
         if det.quantity_source_label == "fallback":
@@ -1199,6 +1722,7 @@ def compress_groups(
     run_log_path: Path,
     run_log_data: Dict[str, Any],
     run: Dict[str, Any],
+    compression_status: Optional[Dict[str, str]] = None,
 ) -> int:
     failed_count = 0
     print("\n开始压缩最终文件夹：")
@@ -1206,19 +1730,26 @@ def compress_groups(
         print("- 没有需要压缩的最终文件夹")
         return failed_count
     for group in groups:
+        key = absolute_text(group.target_path)
         zip_path = zip_path_for_folder(group.target_path)
         if not group.target_path.exists() or not group.target_path.is_dir():
             log_group_zip(log_path, "apply", "zip", group, status="skipped", error_message="最终文件夹不存在，跳过压缩。")
+            if compression_status is not None:
+                compression_status[key] = "未压缩：最终文件夹不存在"
             print(f"跳过压缩：最终文件夹不存在 -> {group.target_path}")
             continue
         if zip_path.exists():
             log_group_zip(log_path, "apply", "zip", group, status="skipped", error_message="同名 zip 已存在，未覆盖。")
+            if compression_status is not None:
+                compression_status[key] = "压缩包冲突"
             print(f"跳过压缩：同名 zip 已存在 -> {zip_path}")
             continue
         try:
             add_folder_to_zip(group.target_path, zip_path)
             append_run_operation(run_log_path, run_log_data, run, make_operation("archive_create", target_after=zip_path))
             log_group_zip(log_path, "apply", "zip", group)
+            if compression_status is not None:
+                compression_status[key] = "已压缩"
             print(f"完成压缩：{zip_path.name}")
         except Exception as exc:
             if zip_path.exists():
@@ -1227,6 +1758,8 @@ def compress_groups(
                 except OSError:
                     pass
             log_group_zip(log_path, "apply", "zip", group, status="failed", error_message=str(exc))
+            if compression_status is not None:
+                compression_status[key] = f"压缩失败：{exc}"
             print(f"错误：{group.final_name} 压缩失败，已跳过。原因：{exc}")
             failed_count += 1
     return failed_count
@@ -1463,6 +1996,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "check-config":
+        return command_check_config(argv[1:])
+    if argv and argv[0] == "test-name":
+        return command_test_name(argv[1:])
     args = parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     config_path = Path(args.config).expanduser().resolve()
@@ -1505,6 +2044,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"生成计划失败：{exc}")
         return 1
     if mode == "dry-run":
+        safe_write_organize_report(root, items, groups, mode, log_path, archive_enabled=args.archive, config=config)
         print("dry-run 完成：没有解压、移动、重命名、合并或压缩任何文件夹。")
         print(f"日志已写入：{log_path}")
         return 0
@@ -1529,8 +2069,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if item.skip_reason:
             log_item(log_path, "apply", "skip", item, status="skipped", error_message=item.skip_reason)
     completed_groups, failed_count = apply_plan(groups, log_path, run_log_path, run_log_data, run)
+    compression_status: Dict[str, str] = {}
     if args.archive:
-        failed_count += compress_groups(completed_groups, log_path, run_log_path, run_log_data, run)
+        failed_count += compress_groups(completed_groups, log_path, run_log_path, run_log_data, run, compression_status)
+    safe_write_organize_report(
+        root,
+        items,
+        groups,
+        mode,
+        log_path,
+        archive_enabled=args.archive,
+        config=config,
+        completed_groups=completed_groups,
+        compression_status=compression_status,
+    )
     operation_count = len(run.get("operations", []))
     if operation_count == 0:
         run_status = "failed"

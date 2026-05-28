@@ -1,5 +1,7 @@
 import copy
 import csv
+import contextlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -7,15 +9,19 @@ import unittest
 
 from file_helper import (
     DEFAULT_CONFIG,
+    REPORT_NAME,
     RUN_LOG_NAME,
     apply_plan,
     build_plan,
+    check_config_diagnostics,
     compress_groups,
     create_apply_run,
     deep_merge,
     load_run_log,
+    main,
     make_operation,
     safe_write_run_log,
+    write_organize_report,
     undo_last,
     update_run_status,
     validate_config,
@@ -76,6 +82,11 @@ def mkdir(path: Path) -> Path:
 def read_log_rows(log_path: Path):
     with log_path.open("r", encoding="utf-8-sig", newline="") as f:
         return list(csv.DictReader(f))
+
+
+def write_config(path: Path, body: str) -> Path:
+    path.write_text(body.strip() + "\n", encoding="utf-8")
+    return path
 
 
 class FileHelperCoreTests(unittest.TestCase):
@@ -216,6 +227,253 @@ class FileHelperCoreTests(unittest.TestCase):
             self.assertFalse(any(operation["action"] == "archive_create" for operation in operations))
             rows = read_log_rows(log_path)
             self.assertTrue(any(row["action"] == "zip" and row["status"] == "skipped" for row in rows))
+
+    def test_dry_run_report_contains_specific_reasons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mkdir(root / "0507 普通文件夹 2单3个")
+            mkdir(root / "0501 军牌钥匙扣 1单1个")
+            mkdir(root / "0502 军牌钥匙扣 1单1个")
+            conflict_target = mkdir(root / "1~2-0501-0502-军牌钥匙扣-2单-2个")
+            (conflict_target / "existing.txt").write_text("existing", encoding="utf-8")
+            source = mkdir(root / "0507 军牌项链 1单2个")
+            (source / "source.txt").write_text("source", encoding="utf-8")
+            (root / "3-0507 军牌项链 1单2个.zip").write_text("existing zip placeholder", encoding="utf-8")
+
+            items, groups = build_plan(root, test_config(), "dry-run", root / "rename_log.csv", archive_enabled=True)
+            report_path = write_organize_report(root, items, groups, "dry-run", True)
+            self.assertTrue(report_path.exists())
+
+            content = report_path.read_bytes().decode("utf-8", errors="ignore")
+
+        self.assertEqual(report_path.name, REPORT_NAME)
+        self.assertIn("未识别品类", content)
+        self.assertIn("目标冲突", content)
+        self.assertIn("压缩包冲突", content)
+
+    def test_main_dry_run_writes_report_without_real_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = mkdir(root / "0507 普通文件夹 2单3个")
+
+            result = main(["--root", str(root), "--dry-run"])
+            report_path = root / REPORT_NAME
+
+            self.assertEqual(result, 0)
+            self.assertTrue(source.exists())
+            self.assertTrue(report_path.exists())
+            content = report_path.read_bytes().decode("utf-8", errors="ignore")
+
+        self.assertIn("计划执行", content)
+        self.assertIn("未识别品类", content)
+
+    def test_report_does_not_overwrite_existing_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing = root / REPORT_NAME
+            existing.write_text("keep me", encoding="utf-8")
+            mkdir(root / "0507 普通文件夹 2单3个")
+
+            result = main(["--root", str(root), "--dry-run"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "keep me")
+            self.assertTrue((root / "整理报告-001.xlsx").exists())
+
+    def test_apply_archive_conflict_report_marks_not_compressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = mkdir(root / "0507 军牌项链 1单2个")
+            (source / "source.txt").write_text("source", encoding="utf-8")
+            log_path = root / "rename_log.csv"
+            run_log_path = root / RUN_LOG_NAME
+
+            _items, groups = build_plan(root, test_config(), "apply", log_path)
+            run_log_data, run = create_apply_run(root, run_log_path)
+            completed, _failed_count = apply_plan(groups, log_path, run_log_path, run_log_data, run)
+            zip_path = zip_path_for_folder(completed[0].target_path)
+            zip_path.write_text("existing zip placeholder", encoding="utf-8")
+            compression_status = {}
+            compress_groups(completed, log_path, run_log_path, run_log_data, run, compression_status)
+            report_path = write_organize_report(root, _items, groups, "apply", True, test_config(), completed, compression_status)
+            content = report_path.read_bytes().decode("utf-8", errors="ignore")
+
+        self.assertIn("压缩包冲突", content)
+        self.assertIn("<t>否</t>", content)
+
+    def test_check_config_valid_config_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = write_config(
+                Path(tmp) / "config.yaml",
+                """
+category_priority:
+  - A
+categories:
+  A:
+    keywords:
+      - AAA
+    merge_enabled: true
+do_not_merge_keywords:
+  - 样品
+naming:
+  single_keep_original: true
+  single_template: "{seq}-{clean_original_name}"
+  merged_template: "{seq_range}-{date}-{category}-{orders}单-{quantity}个"
+inner_folder_naming:
+  template: "{seq}-{original_name}"
+sequence:
+  enabled: true
+  scope: all_extracted_folders
+  sort_by: name
+  merged_range_style: min_max
+quantity_detection:
+  source: outer_folder_name_only
+conflict:
+  target_exists: skip
+already_processed:
+  enabled: true
+  action: skip
+  patterns: []
+fallback:
+  unknown_date: "未知日期"
+  unknown_category: "未知产品"
+  default_orders_per_folder: 1
+  default_quantity_per_order: 1
+""",
+            )
+            exit_code, diagnostics = check_config_diagnostics(config_path)
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(any(level == "OK" for level, _message in diagnostics))
+
+    def test_check_config_detects_duplicate_keyword_and_containment_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = write_config(
+                Path(tmp) / "config.yaml",
+                """
+category_priority:
+  - A
+  - B
+categories:
+  A:
+    keywords:
+      - 钥匙扣
+      - 钥匙扣
+    merge_enabled: true
+  B:
+    keywords:
+      - 钥匙扣
+      - 钢片军牌钥匙扣
+    merge_enabled: true
+do_not_merge_keywords:
+  - 样品
+naming:
+  single_template: "{seq}-{clean_original_name}"
+  merged_template: "{seq_range}-{date}-{category}-{orders}单-{quantity}个"
+inner_folder_naming:
+  template: "{seq}-{original_name}"
+sequence:
+  sort_by: name
+  merged_range_style: min_max
+quantity_detection:
+  source: outer_folder_name_only
+conflict:
+  target_exists: skip
+already_processed:
+  enabled: true
+  patterns: []
+fallback:
+  unknown_date: "未知日期"
+  unknown_category: "未知产品"
+  default_orders_per_folder: 1
+  default_quantity_per_order: 1
+""",
+            )
+            exit_code, diagnostics = check_config_diagnostics(config_path)
+            messages = "\n".join(message for _level, message in diagnostics)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("重复关键词", messages)
+        self.assertIn("关键词包含关系", messages)
+        self.assertIn("同一分类内部重复关键词", messages)
+
+    def test_check_config_missing_required_keys_is_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = write_config(Path(tmp) / "config.yaml", "categories: {}")
+            exit_code, diagnostics = check_config_diagnostics(config_path)
+            messages = "\n".join(message for _level, message in diagnostics)
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("缺少必需配置项：category_priority", messages)
+
+    def test_test_name_outputs_detection_and_longest_keyword(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text("categories: {}\n", encoding="utf-8")
+            config = test_config()
+            # Use the real loader path by writing the focused config with PyYAML-compatible text.
+            config_path = write_config(
+                config_path,
+                """
+category_priority:
+  - 军牌钥匙扣
+  - 钢片军牌钥匙扣
+categories:
+  军牌钥匙扣:
+    keywords:
+      - 钥匙扣
+    merge_enabled: true
+  钢片军牌钥匙扣:
+    keywords:
+      - 钢片军牌钥匙扣
+    merge_enabled: true
+do_not_merge_keywords:
+  - 样品
+naming:
+  single_template: "{seq}-{clean_original_name}"
+  merged_template: "{seq_range}-{date}-{category}-{orders}单-{quantity}个"
+inner_folder_naming:
+  template: "{seq}-{original_name}"
+sequence:
+  sort_by: name
+  merged_range_style: min_max
+quantity_detection:
+  source: outer_folder_name_only
+conflict:
+  target_exists: skip
+already_processed:
+  enabled: true
+  patterns:
+    - '^\\d+~\\d+-.+-\\d+单-\\d+个$'
+fallback:
+  unknown_date: "未知日期"
+  unknown_category: "未知产品"
+  default_orders_per_folder: 1
+  default_quantity_per_order: 1
+""",
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = main(["test-name", "0507-WZY-样品-钢片军牌钥匙扣-13单18个", "--config", str(config_path)])
+            text = output.getvalue()
+
+        self.assertEqual(result, 0)
+        self.assertIn("日期：0507", text)
+        self.assertIn("品类：钢片军牌钥匙扣", text)
+        self.assertIn("命中关键词：钢片军牌钥匙扣", text)
+        self.assertIn("单量：13", text)
+        self.assertIn("数量：18", text)
+        self.assertIn("禁止合并：是", text)
+        self.assertIn("采用最长关键词优先", text)
+
+    def test_test_name_marks_already_processed_format(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = main(["test-name", "1~2-0507-军牌钥匙扣-2单-2个"])
+        text = output.getvalue()
+
+        self.assertEqual(result, 0)
+        self.assertIn("已处理格式：是", text)
 
 
 if __name__ == "__main__":

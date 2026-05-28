@@ -3,6 +3,7 @@ rename_log.csv
 organizer_run_log.json
 organizer_run_log.json.tmp
 launcher_settings.json
+整理报告*.xlsx
 *.log
 *.tmp
 
