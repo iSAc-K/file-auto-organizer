@@ -1,13 +1,20 @@
 from pathlib import Path
+import os
 import tempfile
 import unittest
 
 from launcher_core import (
     LauncherSettings,
     build_command,
+    build_preview_rows,
+    build_safety_status_text,
     clean_path_value,
+    find_latest_report,
     format_python_command,
+    load_settings,
     ps_quote,
+    read_version,
+    undo_log_status,
 )
 
 
@@ -107,6 +114,95 @@ class LauncherCoreTests(unittest.TestCase):
             self.assertNotIn("--archive", command)
             self.assertNotIn("--apply", command)
             self.assertNotIn("--dry-run", command)
+
+    def test_load_settings_missing_or_damaged_file_returns_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            defaults = LauncherSettings(
+                python_command="py",
+                script_path="helper.py",
+                root_path="",
+                config_path="config.yaml",
+                mode="dry-run",
+                archive_enabled=False,
+                open_result_folder=True,
+            )
+            missing = Path(tmp) / "launcher_settings.json"
+            self.assertEqual(load_settings(missing, defaults), defaults)
+
+            missing.write_text("{not json", encoding="utf-8")
+            self.assertEqual(load_settings(missing, defaults), defaults)
+
+    def test_build_safety_status_text_reflects_mode_and_archive(self):
+        self.assertEqual(
+            build_safety_status_text("dry-run", False),
+            "当前模式：Dry Run｜不会修改文件｜不会压缩｜不会删除原件",
+        )
+        self.assertEqual(
+            build_safety_status_text("apply", True),
+            "当前模式：Apply｜需要确认｜冲突跳过｜不会覆盖已有目标｜压缩：开启｜同名压缩包存在时跳过",
+        )
+        self.assertEqual(
+            build_safety_status_text("undo-last", True),
+            "当前模式：Undo｜撤销：仅根据日志执行｜不会猜测路径｜不会覆盖已有路径",
+        )
+
+    def test_find_latest_report_prefers_newest_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "整理报告.xlsx"
+            newer_dir = root / "logs"
+            newer_dir.mkdir()
+            newer = newer_dir / "整理报告.xlsx"
+            older.write_text("old", encoding="utf-8")
+            newer.write_text("new", encoding="utf-8")
+            os.utime(older, (100, 100))
+            os.utime(newer, (200, 200))
+
+            self.assertEqual(find_latest_report(root), newer)
+
+    def test_undo_log_status_reports_missing_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, message = undo_log_status(Path(tmp))
+            self.assertFalse(ok)
+            self.assertIn("organizer_run_log.json", message)
+
+    def test_build_preview_rows_uses_dry_run_plan_without_renaming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir()
+            original = root / "0507-WZY-钢片军牌钥匙扣-13单18个"
+            original.mkdir()
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                "categories:\n"
+                "  钢片军牌钥匙扣:\n"
+                "    keywords:\n"
+                "      - 钢片军牌钥匙扣\n"
+                "    merge_enabled: true\n"
+                "category_priority:\n"
+                "  - 钢片军牌钥匙扣\n",
+                encoding="utf-8",
+            )
+
+            rows = build_preview_rows(root, config)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].sequence, "1")
+            self.assertEqual(rows[0].original_name, original.name)
+            self.assertEqual(rows[0].detected_date, "0507")
+            self.assertEqual(rows[0].detected_category, "钢片军牌钥匙扣")
+            self.assertEqual(rows[0].matched_keyword, "钢片军牌钥匙扣")
+            self.assertEqual(rows[0].orders, "13")
+            self.assertEqual(rows[0].quantity, "18")
+            self.assertEqual(rows[0].status, "planned")
+            self.assertTrue(original.exists())
+            self.assertFalse((root / f"1-{original.name}").exists())
+
+    def test_read_version_returns_first_version_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            version = Path(tmp) / "VERSION.txt"
+            version.write_text("2.2\nrelease_date: 2026-05-28\n", encoding="utf-8")
+            self.assertEqual(read_version(Path(tmp)), "2.2")
 
 
 if __name__ == "__main__":

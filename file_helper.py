@@ -17,6 +17,7 @@ import re
 import shutil
 import string
 import subprocess
+import sys
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1462,7 +1463,62 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def run_check_config(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="检查 config.yaml 是否可读取并通过校验")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="配置文件路径")
+    args = parser.parse_args(argv)
+    config_path = Path(args.config).expanduser().resolve()
+    try:
+        config = load_config(config_path)
+        validate_config(config)
+    except Exception as exc:
+        print(f"配置检查失败：{exc}")
+        return 1
+    print(f"配置检查通过：{config_path}")
+    print(f"品类数量：{len(config.get('categories', {}))}")
+    return 0
+
+
+def run_test_name(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="测试单个外层名称的识别结果")
+    parser.add_argument("name", help="要测试的外层文件夹或压缩包名称")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="配置文件路径")
+    args = parser.parse_args(argv)
+    config_path = Path(args.config).expanduser().resolve()
+    try:
+        config = load_config(config_path)
+        validate_config(config)
+        item = WorkItem(
+            source_type="folder",
+            original_name=args.name,
+            current_path=Path(args.name),
+            root=Path("."),
+        )
+        scan_and_detect(item, config)
+    except Exception as exc:
+        print(f"名称测试失败：{exc}")
+        return 1
+    det = item.detection
+    print(f"名称：{args.name}")
+    print("识别来源：outer_folder_name_only")
+    print(f"日期：{det.date_label}")
+    print(f"品类：{det.category}")
+    print(f"命中关键词：{det.matched_keyword}")
+    print(f"数量：{det.orders}单{det.quantity}个")
+    print(f"允许合并：{'是' if det.merge_enabled else '否'}")
+    if det.do_not_merge_hits:
+        print(f"强制不合并关键词：{', '.join(det.do_not_merge_hits)}")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv is not None and len(argv) >= 1:
+        if argv[0] == "check-config":
+            return run_check_config(argv[1:])
+        if argv[0] == "test-name":
+            return run_test_name(argv[1:])
     args = parse_args(argv)
     root = Path(args.root).expanduser().resolve()
     config_path = Path(args.config).expanduser().resolve()

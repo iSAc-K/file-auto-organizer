@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
+import tkinter as tk
 from tkinter import filedialog, messagebox
+from tkinter import ttk
 
 import customtkinter as ctk
 
@@ -15,15 +16,20 @@ from launcher_core import (
     LauncherSettings,
     app_base_dir,
     build_command,
+    build_preview_rows,
+    build_safety_status_text,
     clean_path_value,
     default_settings,
-    settings_from_dict,
-    settings_to_dict,
+    find_latest_report,
+    load_settings as core_load_settings,
+    read_version,
+    save_settings as core_save_settings,
+    undo_log_status,
     validate_paths,
 )
 
 
-APP_TITLE = "Windows 文件整理助手"
+APP_TITLE = "Windows 文件整理助手 v2.2"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 
 MODE_LABELS = {
@@ -44,7 +50,9 @@ class LauncherGui:
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
+        self.version = read_version(self.base_dir) or "2.2"
         settings = self.load_settings()
+        self._initializing = True
 
         self.python_command = ctk.StringVar(value=settings.python_command)
         self.script_path = ctk.StringVar(value=settings.script_path)
@@ -57,34 +65,25 @@ class LauncherGui:
         self.mode_buttons: dict[str, ctk.CTkButton] = {}
         self.path_status_labels: dict[str, ctk.CTkLabel] = {}
         self.archive_check: ctk.CTkCheckBox | None = None
+        self.preview_table: ttk.Treeview | None = None
 
         self._build_ui()
         self.run_mode.trace_add("write", self.on_mode_changed)
+        self.use_archive.trace_add("write", self.on_option_changed)
+        self.open_result_folder.trace_add("write", self.on_option_changed)
         for variable in (
             self.python_command,
             self.script_path,
             self.root_path,
             self.config_path,
         ):
-            variable.trace_add("write", self.update_path_status)
+            variable.trace_add("write", self.on_path_changed)
         self.on_mode_changed()
         self.update_path_status()
+        self._initializing = False
 
     def load_settings(self) -> LauncherSettings:
-        if not self.settings_path.exists():
-            return self.defaults
-        try:
-            with self.settings_path.open("r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if not isinstance(loaded, dict):
-                raise ValueError("设置文件顶层必须是对象。")
-        except Exception as exc:
-            messagebox.showwarning(
-                APP_TITLE,
-                f"launcher_settings.json 已损坏，已使用默认设置。\n{exc}",
-            )
-            return self.defaults
-        return settings_from_dict(loaded, self.defaults)
+        return core_load_settings(self.settings_path, self.defaults)
 
     def current_settings(self) -> LauncherSettings:
         mode = self.run_mode.get()
@@ -102,9 +101,7 @@ class LauncherGui:
 
     def save_settings(self, show_message: bool = True) -> None:
         try:
-            with self.settings_path.open("w", encoding="utf-8", newline="\n") as f:
-                json.dump(settings_to_dict(self.current_settings()), f, ensure_ascii=False, indent=2)
-                f.write("\n")
+            core_save_settings(self.settings_path, self.current_settings())
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"保存设置失败：\n{exc}")
             return
@@ -130,6 +127,7 @@ class LauncherGui:
         self.use_archive.set(bool(settings.archive_enabled))
         self.open_result_folder.set(bool(settings.open_result_folder))
         self.set_preview("")
+        self.clear_preview_table()
         self.update_path_status()
 
     def _build_ui(self) -> None:
@@ -151,7 +149,7 @@ class LauncherGui:
         ).grid(row=0, column=0, sticky="w", padx=22, pady=(28, 6))
         ctk.CTkLabel(
             sidebar,
-            text="预览优先 / 确认执行 / 可撤销",
+            text=f"v{self.version} / 预览优先 / 确认执行 / 可撤销",
             text_color="#98A6B3",
             font=ctk.CTkFont(size=12),
         ).grid(row=1, column=0, sticky="w", padx=22, pady=(0, 28))
@@ -162,10 +160,12 @@ class LauncherGui:
 
         self.safety_status = ctk.CTkLabel(
             sidebar,
-            text="当前不会修改文件",
+            text=build_safety_status_text("dry-run", False),
             text_color="#DFF3E8",
             anchor="w",
             font=ctk.CTkFont(size=13, weight="bold"),
+            wraplength=190,
+            justify="left",
         )
         self.safety_status.grid(row=6, column=0, sticky="sew", padx=22, pady=(0, 26))
 
@@ -234,7 +234,7 @@ class LauncherGui:
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header,
-            text="整理任务启动器",
+            text=f"整理任务启动器 v{self.version}",
             text_color="#101820",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=28, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
@@ -439,12 +439,97 @@ class LauncherGui:
             text="普通预览和复制命令不带 --yes；只有确认执行或撤销后才追加。",
             text_color="#667580",
             font=ctk.CTkFont(size=11),
-        ).grid(row=2, column=0, sticky="w", padx=14, pady=(0, 14))
+        ).grid(row=2, column=0, sticky="w", padx=14, pady=(0, 8))
+
+        ctk.CTkLabel(
+            card,
+            text="扫描预览",
+            text_color="#101820",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=3, column=0, sticky="w", padx=14, pady=(0, 8))
+        table_frame = tk.Frame(card, bg="#FFFFFF")
+        table_frame.grid(row=4, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        card.grid_rowconfigure(4, weight=2)
+        columns = (
+            "序号",
+            "原文件夹",
+            "识别日期",
+            "识别品类",
+            "命中关键词",
+            "单量",
+            "数量",
+            "动作",
+            "目标名称",
+            "状态",
+            "原因",
+        )
+        self.preview_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+        y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.preview_table.yview)
+        x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.preview_table.xview)
+        self.preview_table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        widths = {
+            "序号": 48,
+            "原文件夹": 210,
+            "识别日期": 80,
+            "识别品类": 120,
+            "命中关键词": 120,
+            "单量": 55,
+            "数量": 55,
+            "动作": 70,
+            "目标名称": 210,
+            "状态": 80,
+            "原因": 240,
+        }
+        for column in columns:
+            self.preview_table.heading(column, text=column)
+            self.preview_table.column(column, width=widths[column], minwidth=45, stretch=column in {"原文件夹", "目标名称", "原因"})
+        self.preview_table.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
 
     def _build_action_bar(self, parent: ctk.CTkFrame) -> None:
         bar = ctk.CTkFrame(parent, fg_color="transparent")
         bar.grid(row=3, column=0, sticky="ew", pady=(16, 0))
         bar.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(
+            bar,
+            text="扫描预览",
+            command=self.scan_preview,
+            fg_color="#101820",
+            hover_color="#24313C",
+        ).grid(row=0, column=1, padx=(0, 10))
+        ctk.CTkButton(
+            bar,
+            text="打开报告",
+            command=self.open_report,
+            fg_color="#FFFFFF",
+            text_color="#101820",
+            border_color="#C7D0D8",
+            border_width=1,
+            hover_color="#E2E8EE",
+        ).grid(row=0, column=2, padx=(0, 10))
+        ctk.CTkButton(
+            bar,
+            text="预览撤销",
+            command=self.preview_undo,
+            fg_color="#FFFFFF",
+            text_color="#101820",
+            border_color="#C7D0D8",
+            border_width=1,
+            hover_color="#E2E8EE",
+        ).grid(row=0, column=3, padx=(0, 10))
+        ctk.CTkButton(
+            bar,
+            text="撤销上次整理",
+            command=self.run_undo_last,
+            fg_color="#FFFFFF",
+            text_color="#9B3417",
+            border_color="#D59B86",
+            border_width=1,
+            hover_color="#FFF1EA",
+        ).grid(row=0, column=4, padx=(0, 10))
         ctk.CTkButton(
             bar,
             text="生成命令",
@@ -454,7 +539,7 @@ class LauncherGui:
             border_color="#C7D0D8",
             border_width=1,
             hover_color="#E2E8EE",
-        ).grid(row=0, column=1, padx=(0, 10))
+        ).grid(row=0, column=5, padx=(0, 10))
         ctk.CTkButton(
             bar,
             text="复制命令",
@@ -464,15 +549,15 @@ class LauncherGui:
             border_color="#C7D0D8",
             border_width=1,
             hover_color="#E2E8EE",
-        ).grid(row=0, column=2, padx=(0, 10))
+        ).grid(row=0, column=6, padx=(0, 10))
         ctk.CTkButton(
             bar,
             text="后台运行",
             command=self.run_in_powershell,
             fg_color="#F05A28",
             hover_color="#C84418",
-            width=178,
-        ).grid(row=0, column=3)
+            width=136,
+        ).grid(row=0, column=7)
 
     def on_mode_changed(self, *_args: object) -> None:
         mode = self.run_mode.get()
@@ -484,7 +569,7 @@ class LauncherGui:
 
         if mode == "apply":
             self.mode_badge.configure(text="Apply", fg_color="#FFE7D8", text_color="#9B3417")
-            self.safety_status.configure(text="真实整理需要确认", text_color="#FFE7D8")
+            self.safety_status.configure(text=build_safety_status_text(mode, self.use_archive.get()), text_color="#FFE7D8")
             self.mode_description.configure(text="执行前请先查看 dry-run 结果；确认后启动器会追加一次性 --yes。")
             self.mode_help.configure(text="执行模式会移动、合并、重命名文件夹。点击运行时会先弹窗确认。")
             if self.archive_check is not None:
@@ -492,19 +577,35 @@ class LauncherGui:
         elif mode == "undo-last":
             self.use_archive.set(False)
             self.mode_badge.configure(text="Undo", fg_color="#FFE7D8", text_color="#9B3417")
-            self.safety_status.configure(text="撤销需要确认", text_color="#FFE7D8")
+            self.safety_status.configure(text=build_safety_status_text(mode, False), text_color="#FFE7D8")
             self.mode_description.configure(text="撤销只根据 organizer_run_log.json 记录执行，不根据文件名猜测。")
             self.mode_help.configure(text="撤销模式不使用 config.yaml，也不会启用压缩选项。")
             if self.archive_check is not None:
                 self.archive_check.configure(state="disabled")
         else:
             self.mode_badge.configure(text="Dry Run", fg_color="#DFF3E8", text_color="#176342")
-            self.safety_status.configure(text="当前不会修改文件", text_color="#DFF3E8")
+            self.safety_status.configure(text=build_safety_status_text(mode, False), text_color="#DFF3E8")
             self.mode_description.configure(text="先生成预览命令，确认计划后再执行真实整理。")
             self.mode_help.configure(text="预览模式只扫描并输出整理计划，不移动、不合并、不压缩任何文件。")
             if self.archive_check is not None:
                 self.archive_check.configure(state="normal")
         self.update_path_status()
+        self.auto_save_settings()
+
+    def on_option_changed(self, *_args: object) -> None:
+        self.on_mode_changed()
+
+    def on_path_changed(self, *_args: object) -> None:
+        self.update_path_status()
+        self.auto_save_settings()
+
+    def auto_save_settings(self) -> None:
+        if getattr(self, "_initializing", False):
+            return
+        try:
+            core_save_settings(self.settings_path, self.current_settings())
+        except OSError:
+            pass
 
     def update_path_status(self, *_args: object) -> None:
         statuses = {
@@ -564,6 +665,113 @@ class LauncherGui:
         )
         if path:
             self.config_path.set(path)
+
+    def clear_preview_table(self) -> None:
+        if self.preview_table is None:
+            return
+        for row_id in self.preview_table.get_children():
+            self.preview_table.delete(row_id)
+
+    def scan_preview(self) -> None:
+        root_value = clean_path_value(self.root_path.get())
+        config_value = clean_path_value(self.config_path.get())
+        if not root_value:
+            messagebox.showerror(APP_TITLE, "要处理的文件夹路径不能为空。")
+            return
+        if config_value and not Path(config_value).is_file():
+            messagebox.showerror(APP_TITLE, f"config.yaml 不存在：\n{config_value}")
+            return
+        try:
+            rows = build_preview_rows(root_value, config_value or None)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"扫描预览失败：\n{exc}")
+            return
+        self.clear_preview_table()
+        if self.preview_table is not None:
+            for row in rows:
+                self.preview_table.insert(
+                    "",
+                    "end",
+                    values=(
+                        row.sequence,
+                        row.original_name,
+                        row.detected_date,
+                        row.detected_category,
+                        row.matched_keyword,
+                        row.orders,
+                        row.quantity,
+                        row.action,
+                        row.target_name,
+                        row.status,
+                        row.reason,
+                    ),
+                )
+        dry_run_settings = LauncherSettings(
+            python_command=self.python_command.get().strip(),
+            script_path=clean_path_value(self.script_path.get()),
+            root_path=root_value,
+            config_path=config_value,
+            mode="dry-run",
+            archive_enabled=False,
+            open_result_folder=bool(self.open_result_folder.get()),
+        )
+        try:
+            self.set_preview(build_command(dry_run_settings))
+        except ValueError:
+            pass
+        self.save_settings(show_message=False)
+        messagebox.showinfo(APP_TITLE, f"扫描预览完成，共 {len(rows)} 行。没有移动、重命名、压缩或删除文件。")
+
+    def open_report(self) -> None:
+        root_value = clean_path_value(self.root_path.get())
+        if not root_value:
+            messagebox.showwarning(APP_TITLE, "请先选择要处理的文件夹。")
+            return
+        report = find_latest_report(root_value)
+        if report is None:
+            messagebox.showinfo(APP_TITLE, "未找到整理报告，请先执行扫描预览或整理。")
+            return
+        try:
+            os.startfile(report)  # type: ignore[attr-defined]
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"无法打开整理报告：\n{exc}")
+
+    def preview_undo(self) -> None:
+        root_value = clean_path_value(self.root_path.get())
+        if not root_value:
+            messagebox.showwarning(APP_TITLE, "请先选择要处理的文件夹。")
+            return
+        ok, status = undo_log_status(root_value)
+        self.run_mode.set("undo-last")
+        command = self.build_command(include_yes=False)
+        if command:
+            self.set_preview(command)
+        message_type = messagebox.showinfo if ok else messagebox.showwarning
+        message_type(APP_TITLE, f"{status}\n\n预览撤销只生成命令，不追加 --yes，不执行真实撤销。")
+
+    def run_undo_last(self) -> None:
+        root_value = clean_path_value(self.root_path.get())
+        ok, status = undo_log_status(root_value)
+        if not ok:
+            messagebox.showwarning(APP_TITLE, status)
+            return
+        previous_mode = self.run_mode.get()
+        self.run_mode.set("undo-last")
+        if not messagebox.askyesno(
+            "确认撤销上次整理",
+            "此操作将根据 organizer_run_log.json 撤销上次整理。\n"
+            "不会猜测路径。\n"
+            "如果源路径已存在，将跳过。\n"
+            "是否继续？",
+        ):
+            self.run_mode.set(previous_mode)
+            return
+        command = self.build_command(include_yes=True)
+        if not command:
+            return
+        self.set_preview(command)
+        self.save_settings(show_message=False)
+        self.start_background_command(command)
 
     def validate_inputs(self) -> bool:
         _validated, error_message = validate_paths(self.current_settings())
@@ -640,6 +848,9 @@ class LauncherGui:
             return
         if not settings_saved:
             self.save_settings(show_message=False)
+        self.start_background_command(command)
+
+    def start_background_command(self, command: str) -> None:
         log_path = self.base_dir / LAUNCHER_OUTPUT_LOG
         try:
             thread = threading.Thread(
