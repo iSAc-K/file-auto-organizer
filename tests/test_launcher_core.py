@@ -15,6 +15,8 @@ from launcher_core import (
     ps_quote,
     read_version,
     undo_log_status,
+    default_window_geometry,
+    wheel_delta_to_units,
 )
 
 
@@ -203,6 +205,17 @@ class LauncherCoreTests(unittest.TestCase):
             version = Path(tmp) / "VERSION.txt"
             version.write_text("2.2\nrelease_date: 2026-05-28\n", encoding="utf-8")
             self.assertEqual(read_version(Path(tmp)), "2.2")
+
+    def test_wheel_delta_to_units_converts_windows_mousewheel(self):
+        self.assertEqual(wheel_delta_to_units(120), -1)
+        self.assertEqual(wheel_delta_to_units(-120), 1)
+        self.assertEqual(wheel_delta_to_units(240), -2)
+        self.assertEqual(wheel_delta_to_units(0), 0)
+
+    def test_default_window_geometry_caps_to_screen_with_minimum_target(self):
+        self.assertEqual(default_window_geometry(1920, 1080), "1440x900")
+        self.assertEqual(default_window_geometry(1366, 768), "1280x720")
+        self.assertEqual(default_window_geometry(1200, 680), "1120x600")
 
 
 if __name__ == "__main__":

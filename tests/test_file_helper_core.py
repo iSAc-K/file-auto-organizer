@@ -7,6 +7,46 @@ import unittest
 import file_helper
 
 
+class GeneratedMergeFolderNameTests(unittest.TestCase):
+    def test_generated_merge_folder_requires_explicit_merge_sequence_separator(self):
+        cases = {
+            "06-03-HYX-NP图片项链-6单-13个": False,
+            "1~3-0603-NP图片项链-10单-20个": True,
+            "1～3-0603-NP图片项链-10单-20个": True,
+            "1-3-0603-NP图片项链-10单-20个": False,
+            "1+2+3-0603-NP图片项链-10单-20个": True,
+        }
+
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    file_helper.is_generated_merge_folder_name(name),
+                    expected,
+                )
+
+
+class DateDetectionTests(unittest.TestCase):
+    def test_detects_hyphenated_date_at_start_of_original_name(self):
+        dates, label, sources = file_helper.detect_dates(
+            "06-03-HYX-NP图片项链-6单-13个",
+            "未知日期",
+        )
+
+        self.assertEqual(dates, ["0603"])
+        self.assertEqual(label, "0603")
+        self.assertEqual(sources, ["outer_folder_name_only"])
+
+    def test_detects_compact_date_after_numeric_sequence_prefix(self):
+        dates, label, sources = file_helper.detect_dates(
+            "10-0603-产品名-1单-1个",
+            "未知日期",
+        )
+
+        self.assertEqual(dates, ["0603"])
+        self.assertEqual(label, "0603")
+        self.assertEqual(sources, ["outer_folder_name_only"])
+
+
 class FileHelperCliCoreTests(unittest.TestCase):
     def test_check_config_command_validates_config_file(self):
         with tempfile.TemporaryDirectory() as tmp:

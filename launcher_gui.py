@@ -19,6 +19,7 @@ from launcher_core import (
     build_preview_rows,
     build_safety_status_text,
     clean_path_value,
+    default_window_geometry,
     default_settings,
     find_latest_report,
     load_settings as core_load_settings,
@@ -26,10 +27,11 @@ from launcher_core import (
     save_settings as core_save_settings,
     undo_log_status,
     validate_paths,
+    wheel_delta_to_units,
 )
 
 
-APP_TITLE = "Windows 文件整理助手 v2.2"
+APP_TITLE = "Windows 文件整理助手 v2.3"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 
 MODE_LABELS = {
@@ -43,14 +45,15 @@ class LauncherGui:
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.minsize(1080, 680)
+        self.root.minsize(1280, 720)
+        self.root.geometry(default_window_geometry(self.root.winfo_screenwidth(), self.root.winfo_screenheight()))
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
 
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
-        self.version = read_version(self.base_dir) or "2.2"
+        self.version = read_version(self.base_dir) or "2.3"
         settings = self.load_settings()
         self._initializing = True
 
@@ -66,6 +69,10 @@ class LauncherGui:
         self.path_status_labels: dict[str, ctk.CTkLabel] = {}
         self.archive_check: ctk.CTkCheckBox | None = None
         self.preview_table: ttk.Treeview | None = None
+        self.main_canvas: tk.Canvas | None = None
+        self.scroll_container: tk.Frame | None = None
+        self.scroll_window_id: int | None = None
+        self.main_scroll_active = False
 
         self._build_ui()
         self.run_mode.trace_add("write", self.on_mode_changed)
@@ -132,10 +139,18 @@ class LauncherGui:
 
     def _build_ui(self) -> None:
         self.root.configure(fg_color="#EEF2F4")
-        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=0)
 
-        sidebar = ctk.CTkFrame(self.root, fg_color="#101820", corner_radius=0, width=238)
+        body = ctk.CTkFrame(self.root, fg_color="#EEF2F4", corner_radius=0)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=0)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(2, weight=0)
+        body.grid_rowconfigure(0, weight=1)
+
+        sidebar = ctk.CTkFrame(body, fg_color="#101820", corner_radius=0, width=238)
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
         sidebar.grid_rowconfigure(5, weight=1)
@@ -169,21 +184,48 @@ class LauncherGui:
         )
         self.safety_status.grid(row=6, column=0, sticky="sew", padx=22, pady=(0, 26))
 
-        workspace = ctk.CTkFrame(self.root, fg_color="#EEF2F4", corner_radius=0)
-        workspace.grid(row=0, column=1, sticky="nsew", padx=26, pady=24)
-        workspace.grid_columnconfigure(0, weight=1)
-        workspace.grid_rowconfigure(2, weight=1)
+        center_shell = ctk.CTkFrame(body, fg_color="#EEF2F4", corner_radius=0)
+        center_shell.grid(row=0, column=1, sticky="nsew", padx=26, pady=(22, 16))
+        center_shell.grid_columnconfigure(0, weight=1)
+        center_shell.grid_rowconfigure(0, weight=0)
+        center_shell.grid_rowconfigure(1, weight=1)
 
-        self._build_header(workspace)
+        self._build_header(center_shell)
 
-        content = ctk.CTkFrame(workspace, fg_color="transparent")
-        content.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
-        content.grid_columnconfigure(0, weight=1)
-        content.grid_columnconfigure(1, minsize=310)
-        content.grid_rowconfigure(0, weight=1)
+        scroll_container = tk.Frame(center_shell, bg="#EEF2F4")
+        self.scroll_container = scroll_container
+        scroll_container.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
+        scroll_container.grid_columnconfigure(0, weight=1)
+        scroll_container.grid_rowconfigure(0, weight=1)
+        scroll_container.bind("<Enter>", lambda _event: self.set_main_scroll_active(True))
+        scroll_container.bind("<Leave>", lambda _event: self.set_main_scroll_active(False))
 
-        left = ctk.CTkFrame(content, fg_color="transparent")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+        self.main_canvas = tk.Canvas(
+            scroll_container,
+            bg="#EEF2F4",
+            highlightthickness=0,
+            borderwidth=0,
+            yscrollincrement=24,
+        )
+        main_scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=main_scrollbar.set)
+        self.main_canvas.grid(row=0, column=0, sticky="nsew")
+        main_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        scrollable_frame = ctk.CTkFrame(self.main_canvas, fg_color="#EEF2F4", corner_radius=0)
+        self.scroll_window_id = self.main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        scrollable_frame.bind("<Configure>", self.on_scroll_frame_configure)
+        scrollable_frame.bind("<Enter>", lambda _event: self.set_main_scroll_active(True))
+        scrollable_frame.bind("<Leave>", lambda _event: self.set_main_scroll_active(False))
+        self.main_canvas.bind("<Configure>", self.on_main_canvas_configure)
+        self.main_canvas.bind_all("<MouseWheel>", self.on_main_mousewheel)
+        self.main_canvas.bind_all("<Button-4>", self.on_linux_scroll_up)
+        self.main_canvas.bind_all("<Button-5>", self.on_linux_scroll_down)
+
+        scrollable_frame.grid_columnconfigure(0, weight=1)
+
+        left = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14), pady=(0, 18))
         left.grid_columnconfigure(0, weight=1)
         left.grid_rowconfigure(4, weight=1)
 
@@ -221,12 +263,13 @@ class LauncherGui:
         )
         self._build_command_area(left)
 
-        right = ctk.CTkFrame(content, fg_color="#FFFFFF", border_color="#D6DEE5", border_width=1, corner_radius=8)
-        right.grid(row=0, column=1, sticky="nsew")
+        right = ctk.CTkFrame(body, fg_color="#FFFFFF", border_color="#D6DEE5", border_width=1, corner_radius=8, width=310)
+        right.grid(row=0, column=2, sticky="nsew", padx=(0, 24), pady=(22, 16))
+        right.grid_propagate(False)
         right.grid_columnconfigure(0, weight=1)
         self._build_options_area(right)
 
-        self._build_action_bar(workspace)
+        self._build_action_bar(self.root)
 
     def _build_header(self, parent: ctk.CTkFrame) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -416,7 +459,8 @@ class LauncherGui:
         )
         card.grid(row=4, column=0, sticky="nsew")
         card.grid_columnconfigure(0, weight=1)
-        card.grid_rowconfigure(1, weight=1)
+        card.grid_rowconfigure(1, weight=0)
+        card.grid_rowconfigure(4, weight=1)
         parent.grid_rowconfigure(4, weight=1)
         ctk.CTkLabel(
             card,
@@ -426,7 +470,7 @@ class LauncherGui:
         ).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 8))
         self.command_preview = ctk.CTkTextbox(
             card,
-            height=150,
+            height=140,
             wrap="word",
             fg_color="#101820",
             text_color="#DCE6EE",
@@ -434,6 +478,7 @@ class LauncherGui:
             font=ctk.CTkFont(family="Consolas", size=12),
         )
         self.command_preview.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
+        self.bind_textbox_mousewheel(self.command_preview)
         ctk.CTkLabel(
             card,
             text="普通预览和复制命令不带 --yes；只有确认执行或撤销后才追加。",
@@ -449,7 +494,6 @@ class LauncherGui:
         ).grid(row=3, column=0, sticky="w", padx=14, pady=(0, 8))
         table_frame = tk.Frame(card, bg="#FFFFFF")
         table_frame.grid(row=4, column=0, sticky="nsew", padx=14, pady=(0, 14))
-        card.grid_rowconfigure(4, weight=2)
         columns = (
             "序号",
             "原文件夹",
@@ -463,10 +507,13 @@ class LauncherGui:
             "状态",
             "原因",
         )
-        self.preview_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+        self.preview_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
         y_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.preview_table.yview)
         x_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.preview_table.xview)
         self.preview_table.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.preview_table.bind("<MouseWheel>", self.on_preview_table_mousewheel)
+        self.preview_table.bind("<Button-4>", self.on_preview_table_scroll_up)
+        self.preview_table.bind("<Button-5>", self.on_preview_table_scroll_down)
         widths = {
             "序号": 48,
             "原文件夹": 210,
@@ -489,17 +536,90 @@ class LauncherGui:
         table_frame.grid_columnconfigure(0, weight=1)
         table_frame.grid_rowconfigure(0, weight=1)
 
+    def on_scroll_frame_configure(self, _event: tk.Event) -> None:
+        if self.main_canvas is not None:
+            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+    def on_main_canvas_configure(self, event: tk.Event) -> None:
+        if self.main_canvas is not None and self.scroll_window_id is not None:
+            self.main_canvas.itemconfigure(self.scroll_window_id, width=event.width)
+
+    def set_main_scroll_active(self, active: bool) -> None:
+        self.main_scroll_active = active
+
+    def is_pointer_in_main_scroll(self) -> bool:
+        if self.scroll_container is None:
+            return False
+        pointer_x = self.scroll_container.winfo_pointerx()
+        pointer_y = self.scroll_container.winfo_pointery()
+        left = self.scroll_container.winfo_rootx()
+        top = self.scroll_container.winfo_rooty()
+        right = left + self.scroll_container.winfo_width()
+        bottom = top + self.scroll_container.winfo_height()
+        return left <= pointer_x <= right and top <= pointer_y <= bottom
+
+    def on_main_mousewheel(self, event: tk.Event) -> None:
+        if self.main_canvas is None or not self.is_pointer_in_main_scroll():
+            return
+        units = wheel_delta_to_units(int(event.delta))
+        if units:
+            self.main_canvas.yview_scroll(units, "units")
+
+    def on_linux_scroll_up(self, _event: tk.Event) -> None:
+        if self.main_canvas is not None and self.is_pointer_in_main_scroll():
+            self.main_canvas.yview_scroll(-1, "units")
+
+    def on_linux_scroll_down(self, _event: tk.Event) -> None:
+        if self.main_canvas is not None and self.is_pointer_in_main_scroll():
+            self.main_canvas.yview_scroll(1, "units")
+
+    def on_preview_table_mousewheel(self, event: tk.Event) -> str:
+        if self.preview_table is not None:
+            units = wheel_delta_to_units(int(event.delta))
+            if units:
+                self.preview_table.yview_scroll(units, "units")
+        return "break"
+
+    def on_preview_table_scroll_up(self, _event: tk.Event) -> str:
+        if self.preview_table is not None:
+            self.preview_table.yview_scroll(-1, "units")
+        return "break"
+
+    def on_preview_table_scroll_down(self, _event: tk.Event) -> str:
+        if self.preview_table is not None:
+            self.preview_table.yview_scroll(1, "units")
+        return "break"
+
+    def bind_textbox_mousewheel(self, textbox: ctk.CTkTextbox) -> None:
+        inner = getattr(textbox, "_textbox", None)
+        target = inner if inner is not None else textbox
+        target.bind("<MouseWheel>", lambda event: self.on_textbox_mousewheel(textbox, event))
+        target.bind("<Button-4>", lambda _event: self.on_textbox_scroll(textbox, -1))
+        target.bind("<Button-5>", lambda _event: self.on_textbox_scroll(textbox, 1))
+
+    def on_textbox_mousewheel(self, textbox: ctk.CTkTextbox, event: tk.Event) -> str:
+        units = wheel_delta_to_units(int(event.delta))
+        if units:
+            textbox.yview_scroll(units, "units")
+        return "break"
+
+    def on_textbox_scroll(self, textbox: ctk.CTkTextbox, units: int) -> str:
+        textbox.yview_scroll(units, "units")
+        return "break"
+
     def _build_action_bar(self, parent: ctk.CTkFrame) -> None:
-        bar = ctk.CTkFrame(parent, fg_color="transparent")
-        bar.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        bar = ctk.CTkFrame(parent, fg_color="#FFFFFF", corner_radius=0, border_color="#D6DEE5", border_width=1)
+        bar.grid(row=1, column=0, sticky="ew")
         bar.grid_columnconfigure(0, weight=1)
+        bar.grid_columnconfigure(8, weight=1)
         ctk.CTkButton(
             bar,
             text="扫描预览",
             command=self.scan_preview,
             fg_color="#101820",
             hover_color="#24313C",
-        ).grid(row=0, column=1, padx=(0, 10))
+            width=112,
+        ).grid(row=0, column=1, padx=(0, 10), pady=12)
         ctk.CTkButton(
             bar,
             text="打开报告",
@@ -509,7 +629,8 @@ class LauncherGui:
             border_color="#C7D0D8",
             border_width=1,
             hover_color="#E2E8EE",
-        ).grid(row=0, column=2, padx=(0, 10))
+            width=104,
+        ).grid(row=0, column=2, padx=(0, 10), pady=12)
         ctk.CTkButton(
             bar,
             text="预览撤销",
@@ -519,7 +640,8 @@ class LauncherGui:
             border_color="#C7D0D8",
             border_width=1,
             hover_color="#E2E8EE",
-        ).grid(row=0, column=3, padx=(0, 10))
+            width=104,
+        ).grid(row=0, column=3, padx=(0, 10), pady=12)
         ctk.CTkButton(
             bar,
             text="撤销上次整理",
@@ -529,7 +651,8 @@ class LauncherGui:
             border_color="#D59B86",
             border_width=1,
             hover_color="#FFF1EA",
-        ).grid(row=0, column=4, padx=(0, 10))
+            width=132,
+        ).grid(row=0, column=4, padx=(0, 10), pady=12)
         ctk.CTkButton(
             bar,
             text="生成命令",
@@ -539,7 +662,8 @@ class LauncherGui:
             border_color="#C7D0D8",
             border_width=1,
             hover_color="#E2E8EE",
-        ).grid(row=0, column=5, padx=(0, 10))
+            width=104,
+        ).grid(row=0, column=5, padx=(0, 10), pady=12)
         ctk.CTkButton(
             bar,
             text="复制命令",
@@ -549,7 +673,8 @@ class LauncherGui:
             border_color="#C7D0D8",
             border_width=1,
             hover_color="#E2E8EE",
-        ).grid(row=0, column=6, padx=(0, 10))
+            width=104,
+        ).grid(row=0, column=6, padx=(0, 10), pady=12)
         ctk.CTkButton(
             bar,
             text="后台运行",
@@ -557,7 +682,7 @@ class LauncherGui:
             fg_color="#F05A28",
             hover_color="#C84418",
             width=136,
-        ).grid(row=0, column=7)
+        ).grid(row=0, column=7, pady=12)
 
     def on_mode_changed(self, *_args: object) -> None:
         mode = self.run_mode.get()

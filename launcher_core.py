@@ -174,6 +174,22 @@ def build_safety_status_text(mode: str, archive_enabled: bool) -> str:
     return "当前模式：Dry Run｜不会修改文件｜不会压缩｜不会删除原件"
 
 
+def wheel_delta_to_units(delta: int) -> int:
+    if delta == 0:
+        return 0
+    return int(-1 * (delta / 120))
+
+
+def default_window_geometry(screen_width: int, screen_height: int) -> str:
+    width = min(1440, max(1120, screen_width - 80))
+    height = min(900, max(600, screen_height - 80))
+    if screen_width >= 1280 and width < 1440:
+        width = 1280
+    if screen_height >= 720 and height < 900:
+        height = 720
+    return f"{width}x{height}"
+
+
 def find_latest_report(root_path: str | Path, output_dir: str | Path | None = None) -> Path | None:
     candidates: list[Path] = []
     roots = [Path(root_path)]
