@@ -42,8 +42,8 @@ QUANTITY_SOURCE_LABELS = {
     "fallback": "fallback",
 }
 GENERATED_MERGE_FOLDER_PATTERNS = [
-    re.compile(r"^\d+(?:[~～-]\d+|\+\d+(?:\+\d+)*)-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$"),
-    re.compile(r"^\d+(?:[~～]\d+|-\d{1,3}|\+\d+(?:\+\d+)*)-.+-\d+单-\d+个$"),
+    re.compile(r"^\d+(?:[~～]\d+|\+\d+(?:\+\d+)*)-(?:\d{4}|未知日期|\d{4}-\d{4})-.+-\d+单-\d+个$"),
+    re.compile(r"^\d+(?:[~～]\d+|\+\d+(?:\+\d+)*)-.+-\d+单-\d+个$"),
 ]
 LOG_FIELDS = [
     "time",
@@ -1190,14 +1190,13 @@ def normalize_date(month: int, day: int) -> Optional[str]:
 def detect_dates(original_name: str, unknown: str) -> Tuple[List[str], str, List[str]]:
     sources: List[str] = []
     found: List[str] = []
-    search_text = re.sub(r"^\d{1,3}\s*[-_]\s*", "", original_name, count=1)
     patterns = [
         re.compile(r"(?<!\d)(?:20\d{2})[-.]?(0[1-9]|1[0-2])[-.]?([0-2]\d|3[01])(?!\d)"),
         re.compile(r"(?<!\d)(0?[1-9]|1[0-2])[-.](0?[1-9]|[12]\d|3[01])(?!\d)"),
         re.compile(r"(?<!\d)(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)"),
     ]
     for pattern in patterns:
-        for match in pattern.finditer(search_text):
+        for match in pattern.finditer(original_name):
             date_text = normalize_date(int(match.group(1)), int(match.group(2)))
             if date_text:
                 found.append(date_text)

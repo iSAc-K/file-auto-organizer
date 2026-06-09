@@ -21,6 +21,23 @@ class LauncherSettings:
     mode: Mode
     archive_enabled: bool
     open_result_folder: bool
+    last_output_dir: str = ""
+    workers: int = 4
+
+
+@dataclass(frozen=True)
+class PreviewRow:
+    sequence: str
+    original_name: str
+    detected_date: str
+    detected_category: str
+    matched_keyword: str
+    orders: str
+    quantity: str
+    action: str
+    target_name: str
+    status: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -79,6 +96,8 @@ def default_settings(base_dir: Path | None = None) -> LauncherSettings:
         mode="dry-run",
         archive_enabled=False,
         open_result_folder=True,
+        last_output_dir="",
+        workers=4,
     )
 
 
@@ -91,6 +110,11 @@ def settings_to_dict(settings: LauncherSettings) -> dict[str, object]:
         "mode": settings.mode,
         "archive_enabled": bool(settings.archive_enabled),
         "open_result_folder": bool(settings.open_result_folder),
+        "last_output_dir": clean_path_value(settings.last_output_dir),
+        "last_root_dir": clean_path_value(settings.root_path),
+        "last_config_path": clean_path_value(settings.config_path),
+        "last_python_path": settings.python_command.strip(),
+        "workers": int(settings.workers),
     }
 
 
@@ -99,6 +123,12 @@ def settings_from_dict(data: dict[str, Any], defaults: LauncherSettings) -> Laun
     for key in merged:
         if key in data:
             merged[key] = data[key]
+    if data.get("last_root_dir") and not data.get("root_path"):
+        merged["root_path"] = data["last_root_dir"]
+    if data.get("last_config_path") and not data.get("config_path"):
+        merged["config_path"] = data["last_config_path"]
+    if data.get("last_python_path") and not data.get("python_command"):
+        merged["python_command"] = data["last_python_path"]
 
     return LauncherSettings(
         python_command=str(merged["python_command"]).strip(),
@@ -108,23 +138,155 @@ def settings_from_dict(data: dict[str, Any], defaults: LauncherSettings) -> Laun
         mode=coerce_mode(merged["mode"]),
         archive_enabled=bool(merged["archive_enabled"]),
         open_result_folder=bool(merged["open_result_folder"]),
+        last_output_dir=clean_path_value(str(merged.get("last_output_dir", ""))),
+        workers=int(merged.get("workers", 4) or 4),
     )
 
 
 def load_settings(settings_path: Path, defaults: LauncherSettings) -> LauncherSettings:
     if not settings_path.exists():
         return defaults
-    with settings_path.open("r", encoding="utf-8") as f:
-        loaded = json.load(f)
-    if not isinstance(loaded, dict):
-        raise ValueError("launcher_settings.json 顶层必须是对象。")
-    return settings_from_dict(loaded, defaults)
+    try:
+        with settings_path.open("r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            raise ValueError("launcher_settings.json 顶层必须是对象。")
+        return settings_from_dict(loaded, defaults)
+    except Exception:
+        return defaults
 
 
 def save_settings(settings_path: Path, settings: LauncherSettings) -> None:
     with settings_path.open("w", encoding="utf-8", newline="\n") as f:
         json.dump(settings_to_dict(settings), f, ensure_ascii=False, indent=2)
         f.write("\n")
+
+
+def build_safety_status_text(mode: str, archive_enabled: bool) -> str:
+    normalized = coerce_mode(mode)
+    if normalized == "apply":
+        text = "当前模式：Apply｜需要确认｜冲突跳过｜不会覆盖已有目标"
+        if archive_enabled:
+            text += "｜压缩：开启｜同名压缩包存在时跳过"
+        return text
+    if normalized == "undo-last":
+        return "当前模式：Undo｜撤销：仅根据日志执行｜不会猜测路径｜不会覆盖已有路径"
+    return "当前模式：Dry Run｜不会修改文件｜不会压缩｜不会删除原件"
+
+
+def wheel_delta_to_units(delta: int) -> int:
+    if delta == 0:
+        return 0
+    return int(-1 * (delta / 120))
+
+
+def default_window_geometry(screen_width: int, screen_height: int) -> str:
+    width = min(1440, max(1120, screen_width - 80))
+    height = min(900, max(600, screen_height - 80))
+    if screen_width >= 1280 and width < 1440:
+        width = 1280
+    if screen_height >= 720 and height < 900:
+        height = 720
+    return f"{width}x{height}"
+
+
+def find_latest_report(root_path: str | Path, output_dir: str | Path | None = None) -> Path | None:
+    candidates: list[Path] = []
+    roots = [Path(root_path)]
+    if output_dir:
+        roots.append(Path(output_dir))
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        direct = root / "整理报告.xlsx"
+        if direct.exists() and direct.is_file():
+            candidates.append(direct)
+        logs_report = root / "logs" / "整理报告.xlsx"
+        if logs_report.exists() and logs_report.is_file():
+            candidates.append(logs_report)
+        try:
+            candidates.extend(path for path in root.glob("*/整理报告.xlsx") if path.is_file())
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def undo_log_status(root_path: str | Path) -> tuple[bool, str]:
+    root = Path(root_path)
+    run_log = root / "organizer_run_log.json"
+    if not run_log.exists():
+        return False, f"未找到 organizer_run_log.json：{run_log}"
+    try:
+        with run_log.open("r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception as exc:
+        return False, f"organizer_run_log.json 无法读取：{exc}"
+    runs = data.get("runs") if isinstance(data, dict) else None
+    if not isinstance(runs, list) or not runs:
+        return False, "organizer_run_log.json 中没有可检查的运行记录。"
+    return True, f"已找到 organizer_run_log.json，共 {len(runs)} 条运行记录。"
+
+
+def read_version(base_dir: str | Path | None = None) -> str:
+    root = Path(base_dir) if base_dir is not None else app_base_dir()
+    version_path = root / "VERSION.txt"
+    if not version_path.exists():
+        return ""
+    for line in version_path.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if value:
+            return value[1:] if value.lower().startswith("v") else value
+    return ""
+
+
+def build_preview_rows(root_path: str | Path, config_path: str | Path | None = None) -> list[PreviewRow]:
+    from file_helper import build_plan, load_config, validate_config
+
+    root = Path(root_path).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"root 不是有效目录：{root}")
+    config_file = Path(config_path).expanduser().resolve() if config_path else app_base_dir() / "config.yaml"
+    config = load_config(config_file)
+    validate_config(config)
+    log_path = root / "rename_log.csv"
+    items, groups = build_plan(root, config, "dry-run", log_path, archive_enabled=False)
+    group_by_item = {id(item): group for group in groups for item in group.items}
+    rows: list[PreviewRow] = []
+    for item in sorted(items, key=lambda current: current.sequence_number or 999999):
+        det = item.detection
+        group = group_by_item.get(id(item))
+        reason = item.skip_reason
+        status = "skipped" if item.skip_reason else "planned"
+        target_name = group.final_name if group else ""
+        if group and group.target_path.exists() and group.target_path != item.current_path:
+            status = "conflict"
+            reason = "目标目录已存在，apply 会按 skip 处理。"
+        if item.skip_reason:
+            action = "跳过"
+        elif group and group.is_merge:
+            action = "合并"
+        elif group and item.current_path == group.target_path:
+            action = "保持"
+        else:
+            action = "重命名"
+        rows.append(
+            PreviewRow(
+                sequence=str(item.sequence_number or ""),
+                original_name=item.original_name,
+                detected_date=det.date_label,
+                detected_category=det.category,
+                matched_keyword=det.matched_keyword,
+                orders=str(det.orders or ""),
+                quantity=str(det.quantity or ""),
+                action=action,
+                target_name=target_name,
+                status=status,
+                reason=reason,
+            )
+        )
+    return rows
 
 
 def validate_paths(settings: LauncherSettings) -> tuple[ValidationResult | None, str | None]:
@@ -166,6 +328,8 @@ def build_command(settings: LauncherSettings, include_yes: bool = False) -> str:
         mode=mode,
         archive_enabled=settings.archive_enabled,
         open_result_folder=settings.open_result_folder,
+        last_output_dir=settings.last_output_dir,
+        workers=settings.workers,
     )
     validated, error = validate_paths(normalized)
     if validated is None:
