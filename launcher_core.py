@@ -10,6 +10,21 @@ from typing import Any, Literal, cast
 SETTINGS_NAME = "launcher_settings.json"
 Mode = Literal["dry-run", "apply", "undo-last"]
 VALID_MODES: set[str] = {"dry-run", "apply", "undo-last"}
+PREVIEW_COLUMN_WIDTHS = {
+    "序号": 48,
+    "原文件夹": 210,
+    "识别日期": 82,
+    "识别品类": 118,
+    "命中关键词": 130,
+    "单量": 60,
+    "数量": 60,
+    "动作": 72,
+    "目标名称": 220,
+    "状态": 78,
+    "原因": 240,
+}
+PREVIEW_COLUMN_MAX_WIDTH = 600
+PREVIEW_COLUMN_PADDING = 24
 
 
 @dataclass(frozen=True)
@@ -178,6 +193,24 @@ def wheel_delta_to_units(delta: int) -> int:
     if delta == 0:
         return 0
     return int(-1 * (delta / 120))
+
+
+def preview_expanded_width(default_width: int, measured_widths: list[int]) -> int:
+    if not measured_widths:
+        return default_width
+    return min(
+        PREVIEW_COLUMN_MAX_WIDTH,
+        max(default_width, max(measured_widths) + PREVIEW_COLUMN_PADDING),
+    )
+
+
+def toggle_preview_column(expanded_columns: set[str], column: str) -> set[str]:
+    updated = set(expanded_columns)
+    if column in updated:
+        updated.remove(column)
+    else:
+        updated.add(column)
+    return updated
 
 
 def default_window_geometry(screen_width: int, screen_height: int) -> str:

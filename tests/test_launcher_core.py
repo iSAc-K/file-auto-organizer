@@ -5,6 +5,9 @@ import unittest
 
 from launcher_core import (
     LauncherSettings,
+    PREVIEW_COLUMN_MAX_WIDTH,
+    PREVIEW_COLUMN_PADDING,
+    PREVIEW_COLUMN_WIDTHS,
     build_command,
     build_preview_rows,
     build_safety_status_text,
@@ -13,7 +16,9 @@ from launcher_core import (
     format_python_command,
     load_settings,
     ps_quote,
+    preview_expanded_width,
     read_version,
+    toggle_preview_column,
     undo_log_status,
     default_window_geometry,
     wheel_delta_to_units,
@@ -21,6 +26,58 @@ from launcher_core import (
 
 
 class LauncherCoreTests(unittest.TestCase):
+    def test_preview_column_widths_match_defaults(self):
+        self.assertEqual(
+            PREVIEW_COLUMN_WIDTHS,
+            {
+                "序号": 48,
+                "原文件夹": 210,
+                "识别日期": 82,
+                "识别品类": 118,
+                "命中关键词": 130,
+                "单量": 60,
+                "数量": 60,
+                "动作": 72,
+                "目标名称": 220,
+                "状态": 78,
+                "原因": 240,
+            },
+        )
+        self.assertEqual(PREVIEW_COLUMN_MAX_WIDTH, 600)
+        self.assertEqual(PREVIEW_COLUMN_PADDING, 24)
+
+    def test_preview_expanded_width_keeps_default_for_short_text(self):
+        self.assertEqual(preview_expanded_width(210, [24, 80, 120]), 210)
+        self.assertEqual(preview_expanded_width(210, []), 210)
+
+    def test_preview_expanded_width_adds_padding_to_longest_text(self):
+        self.assertEqual(preview_expanded_width(210, [180, 240, 320]), 344)
+
+    def test_preview_expanded_width_caps_at_maximum(self):
+        self.assertEqual(preview_expanded_width(210, [700]), 600)
+
+    def test_toggle_preview_column_allows_multiple_expanded_columns(self):
+        expanded: set[str] = set()
+        self.assertEqual(toggle_preview_column(expanded, "原因"), {"原因"})
+        self.assertEqual(
+            toggle_preview_column({"原因"}, "原文件夹"),
+            {"原因", "原文件夹"},
+        )
+
+    def test_toggle_preview_column_collapses_only_clicked_column(self):
+        self.assertEqual(
+            toggle_preview_column({"原因", "原文件夹"}, "原因"),
+            {"原文件夹"},
+        )
+
+    def test_toggle_preview_column_returns_new_set(self):
+        expanded = {"原因"}
+
+        updated = toggle_preview_column(expanded, "原文件夹")
+
+        self.assertEqual(expanded, {"原因"})
+        self.assertIsNot(updated, expanded)
+
     def test_ps_quote_escapes_single_quotes(self):
         self.assertEqual(ps_quote(r"D:\client's\root"), r"'D:\client''s\root'")
 

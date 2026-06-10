@@ -6,12 +6,14 @@ import threading
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
 from tkinter import ttk
 
 import customtkinter as ctk
 
 from launcher_core import (
+    PREVIEW_COLUMN_WIDTHS,
     SETTINGS_NAME,
     LauncherSettings,
     app_base_dir,
@@ -23,8 +25,10 @@ from launcher_core import (
     default_settings,
     find_latest_report,
     load_settings as core_load_settings,
+    preview_expanded_width,
     read_version,
     save_settings as core_save_settings,
+    toggle_preview_column,
     undo_log_status,
     validate_paths,
     wheel_delta_to_units,
@@ -69,6 +73,7 @@ class LauncherGui:
         self.path_status_labels: dict[str, ctk.CTkLabel] = {}
         self.archive_check: ctk.CTkCheckBox | None = None
         self.preview_table: ttk.Treeview | None = None
+        self.preview_expanded_columns: set[str] = set()
         self.main_canvas: tk.Canvas | None = None
         self.scroll_container: tk.Frame | None = None
         self.scroll_window_id: int | None = None
@@ -514,22 +519,15 @@ class LauncherGui:
         self.preview_table.bind("<MouseWheel>", self.on_preview_table_mousewheel)
         self.preview_table.bind("<Button-4>", self.on_preview_table_scroll_up)
         self.preview_table.bind("<Button-5>", self.on_preview_table_scroll_down)
-        widths = {
-            "序号": 48,
-            "原文件夹": 210,
-            "识别日期": 80,
-            "识别品类": 120,
-            "命中关键词": 120,
-            "单量": 55,
-            "数量": 55,
-            "动作": 70,
-            "目标名称": 210,
-            "状态": 80,
-            "原因": 240,
-        }
+        self.preview_table.bind("<Button-1>", self.on_preview_table_click, add="+")
         for column in columns:
             self.preview_table.heading(column, text=column)
-            self.preview_table.column(column, width=widths[column], minwidth=45, stretch=column in {"原文件夹", "目标名称", "原因"})
+            self.preview_table.column(
+                column,
+                width=PREVIEW_COLUMN_WIDTHS[column],
+                minwidth=45,
+                stretch=False,
+            )
         self.preview_table.grid(row=0, column=0, sticky="nsew")
         y_scroll.grid(row=0, column=1, sticky="ns")
         x_scroll.grid(row=1, column=0, sticky="ew")
@@ -589,6 +587,71 @@ class LauncherGui:
         if self.preview_table is not None:
             self.preview_table.yview_scroll(1, "units")
         return "break"
+
+    def on_preview_table_click(self, event: tk.Event) -> None:
+        if self.preview_table is None:
+            return
+        if self.preview_table.identify_region(event.x, event.y) != "cell":
+            return
+        column_id = self.preview_table.identify_column(event.x)
+        if not column_id:
+            return
+        try:
+            column_index = int(column_id.removeprefix("#")) - 1
+            if column_index < 0:
+                return
+            column = str(self.preview_table["columns"][column_index])
+        except (ValueError, IndexError):
+            return
+        self.toggle_preview_column_width(column)
+
+    def preview_table_font(self) -> tkfont.Font:
+        font_spec = ttk.Style(self.root).lookup("Treeview", "font") or "TkDefaultFont"
+        if isinstance(font_spec, str):
+            try:
+                return tkfont.nametofont(font_spec)
+            except tk.TclError:
+                pass
+        return tkfont.Font(root=self.root, font=font_spec)
+
+    def preview_column_measured_widths(self, column: str) -> list[int]:
+        if self.preview_table is None:
+            return []
+        try:
+            column_index = list(self.preview_table["columns"]).index(column)
+        except ValueError:
+            return []
+        heading_text = str(self.preview_table.heading(column, "text"))
+        texts = [heading_text]
+        for item_id in self.preview_table.get_children():
+            values = self.preview_table.item(item_id, "values")
+            if column_index < len(values):
+                texts.append(str(values[column_index]))
+        font = self.preview_table_font()
+        return [font.measure(text) for text in texts]
+
+    def toggle_preview_column_width(self, column: str) -> None:
+        if self.preview_table is None or column not in PREVIEW_COLUMN_WIDTHS:
+            return
+        self.preview_expanded_columns = toggle_preview_column(
+            self.preview_expanded_columns,
+            column,
+        )
+        if column in self.preview_expanded_columns:
+            width = preview_expanded_width(
+                PREVIEW_COLUMN_WIDTHS[column],
+                self.preview_column_measured_widths(column),
+            )
+        else:
+            width = PREVIEW_COLUMN_WIDTHS[column]
+        self.preview_table.column(column, width=width, stretch=False)
+
+    def reset_preview_column_widths(self) -> None:
+        self.preview_expanded_columns.clear()
+        if self.preview_table is None:
+            return
+        for column, width in PREVIEW_COLUMN_WIDTHS.items():
+            self.preview_table.column(column, width=width, stretch=False)
 
     def bind_textbox_mousewheel(self, textbox: ctk.CTkTextbox) -> None:
         inner = getattr(textbox, "_textbox", None)
@@ -792,12 +855,14 @@ class LauncherGui:
             self.config_path.set(path)
 
     def clear_preview_table(self) -> None:
+        self.reset_preview_column_widths()
         if self.preview_table is None:
             return
         for row_id in self.preview_table.get_children():
             self.preview_table.delete(row_id)
 
     def scan_preview(self) -> None:
+        self.reset_preview_column_widths()
         root_value = clean_path_value(self.root_path.get())
         config_value = clean_path_value(self.config_path.get())
         if not root_value:
