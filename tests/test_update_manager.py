@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from update_manager import UpdateInfo, is_newer_version, parse_update_manifest, verify_sha256
+from update_manager import (
+    UpdateInfo,
+    fetch_update_info_with_retry,
+    is_newer_version,
+    parse_update_manifest,
+    verify_sha256,
+)
 
 
 class UpdateManagerTests(unittest.TestCase):
@@ -46,6 +52,44 @@ class UpdateManagerTests(unittest.TestCase):
         ).encode("utf-8")
         info = parse_update_manifest(json.loads(payload.decode("utf-8-sig")))
         self.assertEqual(info.version, "2.4.1")
+
+    def test_update_check_retries_transient_failures(self):
+        calls = []
+        sleeps = []
+        expected = UpdateInfo("2.4.2", "https://example.com/app.zip", "a" * 64, [])
+
+        def fetcher():
+            calls.append(1)
+            if len(calls) < 3:
+                raise TimeoutError("temporary timeout")
+            return expected
+
+        result = fetch_update_info_with_retry(
+            attempts=3,
+            retry_delay=0.25,
+            fetcher=fetcher,
+            sleeper=sleeps.append,
+        )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [0.25, 0.25])
+
+    def test_update_check_raises_after_all_attempts_fail(self):
+        calls = []
+
+        def fetcher():
+            calls.append(1)
+            raise TimeoutError("still unavailable")
+
+        with self.assertRaisesRegex(TimeoutError, "still unavailable"):
+            fetch_update_info_with_retry(
+                attempts=2,
+                retry_delay=0,
+                fetcher=fetcher,
+                sleeper=lambda _delay: None,
+            )
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

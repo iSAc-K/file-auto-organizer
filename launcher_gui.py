@@ -22,7 +22,7 @@ from config_manager import (
     save_user_config,
 )
 from file_helper import load_raw_config, validate_config
-from update_manager import download_update, fetch_update_info, is_newer_version
+from update_manager import download_update, fetch_update_info_with_retry, is_newer_version
 from launcher_core import (
     PREVIEW_COLUMN_WIDTHS,
     SETTINGS_NAME,
@@ -47,8 +47,9 @@ from launcher_core import (
 )
 
 
-APP_TITLE = "Windows 文件整理助手 v2.4.2"
+APP_TITLE = "Windows 文件整理助手 v2.4.3"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
+UPDATE_CHECK_LOG = "update_check.log"
 
 MODE_LABELS = {
     "dry-run": "预览模式",
@@ -69,7 +70,7 @@ class LauncherGui:
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
-        self.version = read_version(self.base_dir) or "2.4.2"
+        self.version = read_version(self.base_dir) or "2.4.3"
         settings = self.load_settings()
         self._initializing = True
 
@@ -751,11 +752,17 @@ class LauncherGui:
 
     def _check_for_updates_worker(self) -> None:
         try:
-            info = fetch_update_info()
+            info = fetch_update_info_with_retry()
             if is_newer_version(info.version, self.version):
                 self.root.after(0, lambda: self.offer_update(info))
-        except Exception:
-            return
+        except Exception as exc:
+            log_path = self.base_dir / UPDATE_CHECK_LOG
+            checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                with log_path.open("a", encoding="utf-8") as log_file:
+                    log_file.write(f"[{checked_at}] 检查更新失败：{type(exc).__name__}: {exc}\n")
+            except OSError:
+                pass
 
     def offer_update(self, info: object) -> None:
         version = getattr(info, "version")

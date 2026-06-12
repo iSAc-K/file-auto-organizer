@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 UPDATE_MANIFEST_URL = (
@@ -54,13 +55,33 @@ def parse_update_manifest(data: dict[str, Any]) -> UpdateInfo:
     return UpdateInfo(version, download_url, sha256, [str(note) for note in notes])
 
 
-def fetch_update_info(url: str = UPDATE_MANIFEST_URL, timeout: float = 5.0) -> UpdateInfo:
+def fetch_update_info(url: str = UPDATE_MANIFEST_URL, timeout: float = 15.0) -> UpdateInfo:
     request = urllib.request.Request(url, headers={"User-Agent": "WindowsFileOrganizer-Updater"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         data = json.loads(response.read().decode("utf-8-sig"))
     if not isinstance(data, dict):
         raise ValueError("更新清单顶层必须是对象。")
     return parse_update_manifest(data)
+
+
+def fetch_update_info_with_retry(
+    attempts: int = 3,
+    retry_delay: float = 2.0,
+    fetcher: Callable[[], UpdateInfo] = fetch_update_info,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> UpdateInfo:
+    if attempts < 1:
+        raise ValueError("更新检查次数必须至少为 1。")
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return fetcher()
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                sleeper(retry_delay)
+    assert last_error is not None
+    raise last_error
 
 
 def verify_sha256(path: Path, expected: str) -> bool:
