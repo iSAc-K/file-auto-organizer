@@ -57,7 +57,7 @@ def parse_update_manifest(data: dict[str, Any]) -> UpdateInfo:
 def fetch_update_info(url: str = UPDATE_MANIFEST_URL, timeout: float = 5.0) -> UpdateInfo:
     request = urllib.request.Request(url, headers={"User-Agent": "WindowsFileOrganizer-Updater"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
+        data = json.loads(response.read().decode("utf-8-sig"))
     if not isinstance(data, dict):
         raise ValueError("更新清单顶层必须是对象。")
     return parse_update_manifest(data)

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,18 @@ class UpdateManagerTests(unittest.TestCase):
             expected = hashlib.sha256(b"payload").hexdigest()
             self.assertTrue(verify_sha256(path, expected))
             self.assertFalse(verify_sha256(path, "0" * 64))
+
+    def test_utf8_bom_manifest_can_be_decoded(self):
+        payload = b"\xef\xbb\xbf" + json.dumps(
+            {
+                "version": "2.4.1",
+                "download_url": "https://example.com/app.zip",
+                "sha256": "a" * 64,
+                "notes": [],
+            }
+        ).encode("utf-8")
+        info = parse_update_manifest(json.loads(payload.decode("utf-8-sig")))
+        self.assertEqual(info.version, "2.4.1")
 
 
 if __name__ == "__main__":

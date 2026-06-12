@@ -46,7 +46,7 @@ from launcher_core import (
 )
 
 
-APP_TITLE = "Windows 文件整理助手 v2.4"
+APP_TITLE = "Windows 文件整理助手 v2.4.1"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 
 MODE_LABELS = {
@@ -68,7 +68,7 @@ class LauncherGui:
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
-        self.version = read_version(self.base_dir) or "2.4"
+        self.version = read_version(self.base_dir) or "2.4.1"
         settings = self.load_settings()
         self._initializing = True
 
