@@ -102,7 +102,7 @@ def coerce_mode(value: object) -> Mode:
 def default_settings(base_dir: Path | None = None) -> LauncherSettings:
     resolved_base = base_dir if base_dir is not None else app_base_dir()
     default_script = resolved_base / "file_helper.py"
-    default_config = resolved_base / "config.yaml"
+    default_config = resolved_base / "config.default.yaml"
     return LauncherSettings(
         python_command="py",
         script_path=str(default_script) if default_script.exists() else "",
@@ -280,7 +280,7 @@ def build_preview_rows(root_path: str | Path, config_path: str | Path | None = N
     root = Path(root_path).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError(f"root 不是有效目录：{root}")
-    config_file = Path(config_path).expanduser().resolve() if config_path else app_base_dir() / "config.yaml"
+    config_file = Path(config_path).expanduser().resolve() if config_path else app_base_dir() / "config.default.yaml"
     config = load_config(config_file)
     validate_config(config)
     log_path = root / "rename_log.csv"

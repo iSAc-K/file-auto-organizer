@@ -1,6 +1,6 @@
 # Windows 文件自动化整理脚本
 
-这是一个 Windows 上使用的 Python 命令行文件整理工具。它用于批量处理压缩包和外层文件夹：识别内部文件名或子文件夹名中的日期、产品类型、单数、个数，然后按 `config.yaml` 中的规则重命名或合并。
+这是一个 Windows 上使用的 Python 文件整理工具。它用于批量处理压缩包和外层文件夹：识别外层名称中的日期、产品类型、单数、个数，然后按配置规则重命名或合并。
 
 第一版 MVP 优先保证：
 
@@ -10,7 +10,7 @@
 - 不删除任何文件
 - 不覆盖已有目标目录
 - 合并后保留来源序号文件夹
-- 所有规则尽量从 `config.yaml` 读取
+- 官方规则从 `config.default.yaml` 读取，用户修改保存在 `user_config.yaml`
 - 所有计划和执行结果写入 `rename_log.csv`
 
 ## 安装准备
@@ -77,7 +77,7 @@ python file_helper.py --root "D:\待整理文件" --undo-last
 
 ## 配置产品归类和排序
 
-产品排序在 `config.yaml` 的 `category_priority` 中配置。脚本不会写死品类名称；后续新增标准品类时，把新标准品类同时加入 `category_priority` 和 `categories` 即可。
+官方产品排序在 `config.default.yaml` 的 `category_priority` 中配置。普通用户应在 GUI 的“配置管理”页面调整顺序，不要直接修改官方配置。
 
 ```yaml
 category_priority:
@@ -288,7 +288,7 @@ dry-run 报告显示计划结果，apply 报告显示实际结果。报告字段
 先看命令行输出，再打开 `rename_log.csv`。常见问题：
 
 - 找不到 WinRAR：安装 WinRAR 或把 WinRAR.exe 加入 PATH。
-- config.yaml 格式错误：检查缩进和冒号。
+- 配置文件格式错误：检查缩进和冒号。
 - 模板未知占位符：只使用 README 中列出的占位符。
 - 目标目录已存在：第一版默认跳过，需要人工确认后再处理。
 - 同名 zip 已存在：默认跳过，不覆盖；需要人工确认后再处理旧 zip。
@@ -300,7 +300,7 @@ dry-run 报告显示计划结果，apply 报告显示实际结果。报告字段
 
 ## 发布包同步检查
 
-如果源码里的 `file_helper.py`、`config.yaml`、`README.md` 或 `VERSION.txt` 改过，但发布文件夹没有同步，EXE 旁边的外置脚本和配置可能仍是旧版本。发布前可以运行检查命令：
+如果源码里的 `file_helper.py`、`config_manager.py`、`config.default.yaml`、`README.md` 或 `VERSION.txt` 改过，但发布文件夹没有同步，EXE 旁边的外置脚本和配置可能仍是旧版本。发布前可以运行检查命令：
 
 ```powershell
 python tools/check_release_sync.py --release ".\Windows文件整理助手-v1.2"
@@ -310,10 +310,10 @@ python tools/check_release_sync.py --release ".\Windows文件整理助手-v1.2"
 
 ## 规则验证与诊断
 
-检查 `config.yaml` 是否能正常读取、模板是否有效、关键词是否重复、关键词是否存在包含关系、`category_priority` 是否和品类列表一致：
+检查最终配置是否能正常读取、模板是否有效、关键词是否重复、关键词是否存在包含关系、`category_priority` 是否和品类列表一致：
 
 ```powershell
-python file_helper.py check-config --config config.yaml
+python file_helper.py check-config --config config.default.yaml
 ```
 
 `check-config` 只检查配置，不会修改配置或移动任何文件。输出会区分 `[OK]`、`[WARN]`、`[ERROR]`；警告不一定导致失败，存在错误时返回码为 `1`。
@@ -321,7 +321,7 @@ python file_helper.py check-config --config config.yaml
 测试单个文件夹名或压缩包外层名的识别结果：
 
 ```powershell
-python file_helper.py test-name "0507-WZY-钢片军牌钥匙扣-13单18个" --config config.yaml
+python file_helper.py test-name "0507-WZY-钢片军牌钥匙扣-13单18个" --config config.default.yaml
 ```
 
 `test-name` 只分析输入名称，不扫描目录、不移动文件、不重命名、不压缩、不生成 undo 日志。它会显示识别日期、品类、命中关键词、单量、数量、禁止合并关键词、排序优先级、是否已处理格式、建议输出名和诊断信息。
@@ -338,6 +338,36 @@ py launcher_gui.py
 
 v2.3 的图形启动器仍然只是启动器和预览界面，不重写 `file_helper.py` 里的分类、合并、重命名、压缩或撤销规则。真实整理和真实撤销仍然只能在用户明确确认后，由 GUI 追加一次性 `--yes` 执行。
 
+## v2.4 配置管理与自动更新
+
+发布目录中的配置分为两层：
+
+- `config.default.yaml`：官方完整配置，软件升级时可以更新。
+- `user_config.yaml`：用户差异配置，由 GUI 的“配置管理”页面保存，升级时不会覆盖。
+
+配置管理页面支持：
+
+- 新增自定义品类，以及给官方品类补充关键词。
+- 逐条输入或使用英文逗号、中文逗号、换行批量导入关键词。
+- 使用绿色/灰色滑动开关启用或停用品类、关键词和同品类合并。
+- 使用“上移”“下移”或鼠标拖动调整官方与自定义品类的统一顺序。
+- 停用官方品类或关键词；官方项目不能删除，自定义项目可以删除。
+- 手动保存。离开页面或关闭软件时，有未保存修改会提示保存、放弃或取消。
+
+同一启用关键词不能同时属于两个启用品类。发生冲突时配置不会保存，并显示冲突关键词和品类。停用的品类或关键词不参与冲突检查。
+
+软件启动后会异步检查 GitHub Releases。发现新版时由用户选择是否立即更新，不会静默安装。下载包必须通过 SHA-256 校验；整理任务运行期间不能安装更新。更新器保留：
+
+- `user_config.yaml`
+- `launcher_settings.json`
+- `rename_log.csv`
+- `organizer_run_log.json`
+- `launcher_run_output.log`
+
+软件必须放在当前用户有写入权限的文件夹中，否则无法保存用户配置或执行自动更新。网络不可用不会影响正常整理。
+
+旧版手工修改过的 `config.yaml` 不会被自动猜测或覆盖。如果没有对应旧版官方基准，程序不会冒险自动迁移；应在新版“配置管理”页面重新添加用户品类和关键词，并保留旧文件作为核对依据。
+
 新增功能：
 
 - `扫描预览`：复用 dry-run 计划生成表格，显示序号、原文件夹、识别日期、品类、数量、动作、目标名称、状态和原因，不修改文件。
@@ -349,18 +379,18 @@ v2.3 的图形启动器仍然只是启动器和预览界面，不重写 `file_he
 
 ## Windows exe 使用方式
 
-1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v2.3`。
+1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v2.4`。
 2. 双击 `Windows文件整理助手.exe`。
 3. `file_helper.py 路径` 默认会自动指向 exe 同目录下的 `file_helper.py`。
-4. `config.yaml 路径` 默认会自动指向 exe 同目录下的 `config.yaml`。
+4. 配置路径默认会自动指向 exe 同目录下的 `config.default.yaml`。
 5. 在 `要处理的文件夹路径` 中选择要处理的 root 文件夹。
 6. 先使用默认选中的 `预览模式（--dry-run）` 并运行，确认计划不会做真实修改。
 7. 确认 dry-run 结果无误后，再切换到 `执行整理（--apply）` 运行。
 8. 执行整理点击运行时会先弹窗确认；确认后启动器会通过一次性 `--yes` 执行。
 9. `撤销上次（--undo-last）` 可以撤销最近一次 apply，并同样会先弹窗确认后通过一次性 `--yes` 执行。
 10. `organizer_run_log.json` 和 `rename_log.csv` 会生成在 root 目录中。
-11. `config.yaml` 可以手动编辑，用来增加品类关键词、合并规则和命名规则。
-12. 不要删除 `file_helper.py` 和 `config.yaml`，否则 exe 无法正常调用核心整理脚本和配置。
+11. 用户品类与关键词通过“配置管理”保存到 `user_config.yaml`。
+12. 不要删除 `file_helper.py`、`config_manager.py` 和 `config.default.yaml`，否则 exe 无法正常调用核心整理脚本和配置。
 
 ## 图形启动器 launcher_gui.py
 
@@ -378,7 +408,7 @@ py launcher_gui.py
 
 - 在 `file_helper.py 路径` 中选择本项目里的 `file_helper.py`。
 - 在 `要处理的文件夹路径` 中选择需要整理的根目录，也就是命令行里的 `--root`。
-- `config.yaml 路径` 可以选择本项目里的 `config.yaml`，也可以留空；留空时不会生成 `--config` 参数，由 `file_helper.py` 使用默认配置。
+- 配置路径可以选择其他完整配置；通常保持默认的 `config.default.yaml`，程序会自动叠加同目录 `user_config.yaml`。
 - 路径旁边会显示状态提示：`已找到` 表示路径存在，`未选择` 表示还没有填写，`路径不存在` 表示当前填写内容无效。
 - `预览模式` 对应 `--dry-run`，默认选中，只生成和执行预览命令，不做真实修改。
 - `执行整理` 对应 `--apply`，会执行真实整理；点击运行时会先弹出确认框，确认后启动器才自动追加一次性 `--yes`，PowerShell 不再等待输入大写 `YES`。

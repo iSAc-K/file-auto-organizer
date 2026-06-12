@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 
-DEFAULT_FILES = ("file_helper.py", "config.yaml", "README.md", "VERSION.txt")
+DEFAULT_FILES = (
+    "file_helper.py",
+    "config_manager.py",
+    "config.default.yaml",
+    "updater.py",
+    "README.md",
+    "VERSION.txt",
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -25,7 +32,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--files",
         nargs="*",
         default=list(DEFAULT_FILES),
-        help="要检查的相对文件路径，默认检查 file_helper.py config.yaml README.md VERSION.txt",
+        help="要检查的相对文件路径；user_config.yaml 是用户文件，不参与同步检查",
     )
     return parser.parse_args(argv)
 

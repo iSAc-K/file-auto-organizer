@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
 
 import customtkinter as ctk
 
+from config_manager import (
+    ConfigConflictError,
+    load_user_config,
+    merge_user_config,
+    parse_batch_keywords,
+    save_user_config,
+)
+from file_helper import load_raw_config, validate_config
+from update_manager import download_update, fetch_update_info, is_newer_version
 from launcher_core import (
     PREVIEW_COLUMN_WIDTHS,
     SETTINGS_NAME,
@@ -35,7 +46,7 @@ from launcher_core import (
 )
 
 
-APP_TITLE = "Windows 文件整理助手 v2.3"
+APP_TITLE = "Windows 文件整理助手 v2.4"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 
 MODE_LABELS = {
@@ -57,7 +68,7 @@ class LauncherGui:
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
-        self.version = read_version(self.base_dir) or "2.3"
+        self.version = read_version(self.base_dir) or "2.4"
         settings = self.load_settings()
         self._initializing = True
 
@@ -78,8 +89,16 @@ class LauncherGui:
         self.scroll_container: tk.Frame | None = None
         self.scroll_window_id: int | None = None
         self.main_scroll_active = False
+        self.active_page = "tasks"
+        self.config_dirty = False
+        self.config_entries: dict[str, dict[str, object]] = {}
+        self.config_order: list[str] = []
+        self.selected_config_category = ""
+        self.config_keyword_widgets: list[ctk.CTkFrame] = []
+        self.background_task_running = False
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.run_mode.trace_add("write", self.on_mode_changed)
         self.use_archive.trace_add("write", self.on_option_changed)
         self.open_result_folder.trace_add("write", self.on_option_changed)
@@ -93,6 +112,7 @@ class LauncherGui:
         self.on_mode_changed()
         self.update_path_status()
         self._initializing = False
+        self.root.after(1200, self.check_for_updates_async)
 
     def load_settings(self) -> LauncherSettings:
         return core_load_settings(self.settings_path, self.defaults)
@@ -149,6 +169,7 @@ class LauncherGui:
         self.root.grid_rowconfigure(1, weight=0)
 
         body = ctk.CTkFrame(self.root, fg_color="#EEF2F4", corner_radius=0)
+        self.body = body
         body.grid(row=0, column=0, sticky="nsew")
         body.grid_columnconfigure(0, weight=0)
         body.grid_columnconfigure(1, weight=1)
@@ -158,7 +179,7 @@ class LauncherGui:
         sidebar = ctk.CTkFrame(body, fg_color="#101820", corner_radius=0, width=238)
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
-        sidebar.grid_rowconfigure(5, weight=1)
+        sidebar.grid_rowconfigure(6, weight=1)
 
         ctk.CTkLabel(
             sidebar,
@@ -177,6 +198,19 @@ class LauncherGui:
         self._add_mode_button(sidebar, "dry-run", "预览模式", "--dry-run，不修改文件", 2)
         self._add_mode_button(sidebar, "apply", "执行整理", "--apply，需要确认", 3)
         self._add_mode_button(sidebar, "undo-last", "撤销上次", "--undo-last", 4)
+        self.config_nav_button = ctk.CTkButton(
+            sidebar,
+            text="配置管理\n品类、关键词与排序",
+            command=self.show_config_page,
+            anchor="w",
+            height=58,
+            fg_color="#1B2630",
+            hover_color="#24313C",
+            text_color="#DCE6EE",
+            corner_radius=8,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.config_nav_button.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 10))
 
         self.safety_status = ctk.CTkLabel(
             sidebar,
@@ -190,6 +224,7 @@ class LauncherGui:
         self.safety_status.grid(row=6, column=0, sticky="sew", padx=22, pady=(0, 26))
 
         center_shell = ctk.CTkFrame(body, fg_color="#EEF2F4", corner_radius=0)
+        self.task_center = center_shell
         center_shell.grid(row=0, column=1, sticky="nsew", padx=26, pady=(22, 16))
         center_shell.grid_columnconfigure(0, weight=1)
         center_shell.grid_rowconfigure(0, weight=0)
@@ -269,12 +304,14 @@ class LauncherGui:
         self._build_command_area(left)
 
         right = ctk.CTkFrame(body, fg_color="#FFFFFF", border_color="#D6DEE5", border_width=1, corner_radius=8, width=310)
+        self.task_right = right
         right.grid(row=0, column=2, sticky="nsew", padx=(0, 24), pady=(22, 16))
         right.grid_propagate(False)
         right.grid_columnconfigure(0, weight=1)
         self._build_options_area(right)
 
         self._build_action_bar(self.root)
+        self._build_config_page(body)
 
     def _build_header(self, parent: ctk.CTkFrame) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -316,7 +353,7 @@ class LauncherGui:
         button = ctk.CTkButton(
             parent,
             text=f"{title}\n{subtitle}",
-            command=lambda: self.run_mode.set(value),
+            command=lambda: self.show_task_page(value),
             anchor="w",
             height=58,
             fg_color="#1B2630",
@@ -327,6 +364,436 @@ class LauncherGui:
         )
         button.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 10))
         self.mode_buttons[value] = button
+
+    def show_task_page(self, mode: str) -> None:
+        if self.active_page == "config" and not self.confirm_discard_config_changes():
+            return
+        self.active_page = "tasks"
+        self.config_page.grid_remove()
+        self.task_center.grid()
+        self.task_right.grid()
+        self.action_bar.grid()
+        self.config_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
+        self.run_mode.set(mode)
+
+    def show_config_page(self) -> None:
+        if self.active_page == "config":
+            return
+        self.active_page = "config"
+        self.task_center.grid_remove()
+        self.task_right.grid_remove()
+        self.action_bar.grid_remove()
+        self.config_page.grid()
+        self.config_nav_button.configure(fg_color="#F05A28", text_color="#FFFFFF")
+        for button in self.mode_buttons.values():
+            button.configure(fg_color="#1B2630", text_color="#DCE6EE")
+        self.load_config_editor()
+
+    def _build_config_page(self, parent: ctk.CTkFrame) -> None:
+        page = ctk.CTkFrame(parent, fg_color="#EEF2F4", corner_radius=0)
+        self.config_page = page
+        page.grid(row=0, column=1, columnspan=2, sticky="nsew", padx=(26, 24), pady=(22, 16))
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+        page.grid_remove()
+
+        header = ctk.CTkFrame(page, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header, text="配置管理", text_color="#101820",
+            font=ctk.CTkFont(size=28, weight="bold"),
+        ).grid(row=0, column=0, sticky="w")
+        self.config_status = ctk.CTkLabel(header, text="未修改", text_color="#6A7884")
+        self.config_status.grid(row=0, column=1, padx=12)
+        ctk.CTkButton(header, text="保存配置", command=self.save_config_editor, fg_color="#F05A28").grid(row=0, column=2)
+
+        content = ctk.CTkFrame(page, fg_color="transparent")
+        content.grid(row=1, column=0, sticky="nsew")
+        content.grid_columnconfigure(0, weight=0, minsize=330)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkFrame(content, fg_color="#FFFFFF", border_width=1, border_color="#D6DEE5")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        left.grid_rowconfigure(1, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(left, text="+ 新增品类", command=self.add_config_category, fg_color="#101820").grid(
+            row=0, column=0, sticky="ew", padx=12, pady=12
+        )
+        self.config_category_list = tk.Listbox(
+            left, font=("Microsoft YaHei UI", 12), activestyle="none",
+            selectbackground="#F05A28", borderwidth=0, highlightthickness=0,
+        )
+        self.config_category_list.grid(row=1, column=0, sticky="nsew", padx=12)
+        self.config_category_list.bind("<<ListboxSelect>>", self.on_config_category_selected)
+        self.config_category_list.bind("<ButtonPress-1>", self.on_category_drag_start)
+        self.config_category_list.bind("<B1-Motion>", self.on_category_drag_motion)
+        order_buttons = ctk.CTkFrame(left, fg_color="transparent")
+        order_buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=12)
+        ctk.CTkButton(order_buttons, text="上移", width=88, command=lambda: self.move_config_category(-1)).pack(side="left")
+        ctk.CTkButton(order_buttons, text="下移", width=88, command=lambda: self.move_config_category(1)).pack(side="left", padx=8)
+        ctk.CTkButton(order_buttons, text="删除", width=88, fg_color="#7B8790", command=self.delete_config_category).pack(side="right")
+
+        detail = ctk.CTkFrame(content, fg_color="#FFFFFF", border_width=1, border_color="#D6DEE5")
+        detail.grid(row=0, column=1, sticky="nsew")
+        detail.grid_columnconfigure(0, weight=1)
+        detail.grid_rowconfigure(4, weight=1)
+        self.config_category_title = ctk.CTkLabel(detail, text="请选择品类", font=ctk.CTkFont(size=20, weight="bold"))
+        self.config_category_title.grid(row=0, column=0, sticky="w", padx=18, pady=(18, 8))
+        switches = ctk.CTkFrame(detail, fg_color="transparent")
+        switches.grid(row=1, column=0, sticky="ew", padx=18)
+        self.config_enabled_var = ctk.BooleanVar(value=True)
+        self.config_merge_var = ctk.BooleanVar(value=True)
+        self.config_enabled_switch = ctk.CTkSwitch(
+            switches, text="启用品类", variable=self.config_enabled_var, command=self.update_selected_category_flags,
+            progress_color="#00B978",
+        )
+        self.config_enabled_switch.pack(side="left")
+        self.config_merge_switch = ctk.CTkSwitch(
+            switches, text="允许同品类合并", variable=self.config_merge_var, command=self.update_selected_category_flags,
+            progress_color="#00B978",
+        )
+        self.config_merge_switch.pack(side="left", padx=28)
+
+        add_row = ctk.CTkFrame(detail, fg_color="transparent")
+        add_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(16, 8))
+        add_row.grid_columnconfigure(0, weight=1)
+        self.keyword_entry = ctk.CTkEntry(add_row, placeholder_text="输入一个关键词")
+        self.keyword_entry.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(add_row, text="添加关键词", width=110, command=self.add_single_keyword).grid(row=0, column=1, padx=(8, 0))
+
+        batch = ctk.CTkFrame(detail, fg_color="transparent")
+        batch.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 8))
+        batch.grid_columnconfigure(0, weight=1)
+        self.keyword_batch = ctk.CTkTextbox(batch, height=72)
+        self.keyword_batch.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(batch, text="批量导入", width=110, command=self.add_batch_keywords).grid(row=0, column=1, padx=(8, 0))
+
+        self.keyword_scroll = ctk.CTkScrollableFrame(detail, label_text="关键词（绿色启用，灰色停用）")
+        self.keyword_scroll.grid(row=4, column=0, sticky="nsew", padx=18, pady=(8, 18))
+        self.keyword_scroll.grid_columnconfigure(0, weight=1)
+
+    def load_config_editor(self) -> None:
+        official_path = self.base_dir / "config.default.yaml"
+        user_path = self.base_dir / "user_config.yaml"
+        try:
+            official = load_raw_config(official_path)
+            user = load_user_config(user_path)
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"读取配置失败：\n{exc}")
+            return
+        self.config_entries = {}
+        official_categories = official.get("categories", {}) or {}
+        user_categories = user.get("categories", {}) or {}
+        for name, data in official_categories.items():
+            override = user_categories.get(name, {}) or {}
+            disabled = {str(item).casefold() for item in override.get("disabled_keywords", []) or []}
+            keywords = [
+                {"text": str(word), "official": True, "enabled": str(word).casefold() not in disabled}
+                for word in data.get("keywords", []) or []
+            ]
+            keywords.extend(
+                {"text": str(word), "official": False, "enabled": True}
+                for word in override.get("added_keywords", []) or []
+            )
+            self.config_entries[str(name)] = {
+                "official": True,
+                "enabled": bool(override.get("enabled", True)),
+                "merge_enabled": bool(override.get("merge_enabled", data.get("merge_enabled", False))),
+                "keywords": keywords,
+            }
+        for name, override in user_categories.items():
+            if name in official_categories or not override.get("custom", False):
+                continue
+            disabled = {str(item).casefold() for item in override.get("disabled_keywords", []) or []}
+            self.config_entries[str(name)] = {
+                "official": False,
+                "enabled": bool(override.get("enabled", True)),
+                "merge_enabled": bool(override.get("merge_enabled", True)),
+                "keywords": [
+                    {"text": str(word), "official": False, "enabled": str(word).casefold() not in disabled}
+                    for word in override.get("keywords", []) or []
+                ],
+            }
+        requested = [str(name) for name in user.get("category_order", []) or []]
+        defaults = [str(name) for name in official.get("category_priority", []) or []]
+        self.config_order = []
+        for name in requested + defaults + list(self.config_entries):
+            if name in self.config_entries and name not in self.config_order:
+                self.config_order.append(name)
+        self.config_dirty = False
+        self.config_status.configure(text="未修改", text_color="#6A7884")
+        self.refresh_config_category_list(select_name=self.config_order[0] if self.config_order else "")
+
+    def mark_config_dirty(self) -> None:
+        self.config_dirty = True
+        self.config_status.configure(text="有未保存修改", text_color="#9B3417")
+
+    def refresh_config_category_list(self, select_name: str = "") -> None:
+        self.config_category_list.delete(0, "end")
+        for index, name in enumerate(self.config_order):
+            entry = self.config_entries[name]
+            source = "官方" if entry["official"] else "自定义"
+            state = "" if entry["enabled"] else "（已停用）"
+            self.config_category_list.insert("end", f"{name}  [{source}]{state}")
+            if not entry["enabled"]:
+                self.config_category_list.itemconfig(index, fg="#9AA3AA")
+        if select_name in self.config_order:
+            index = self.config_order.index(select_name)
+            self.config_category_list.selection_set(index)
+            self.config_category_list.activate(index)
+            self.selected_config_category = select_name
+            self.refresh_config_detail()
+
+    def on_config_category_selected(self, _event: object = None) -> None:
+        selection = self.config_category_list.curselection()
+        if not selection:
+            return
+        self.selected_config_category = self.config_order[int(selection[0])]
+        self.refresh_config_detail()
+
+    def refresh_config_detail(self) -> None:
+        name = self.selected_config_category
+        if name not in self.config_entries:
+            return
+        entry = self.config_entries[name]
+        self.config_category_title.configure(text=f"{name}  ·  {'官方' if entry['official'] else '自定义'}")
+        self.config_enabled_var.set(bool(entry["enabled"]))
+        self.config_merge_var.set(bool(entry["merge_enabled"]))
+        for widget in self.config_keyword_widgets:
+            widget.destroy()
+        self.config_keyword_widgets.clear()
+        for index, keyword in enumerate(entry["keywords"]):  # type: ignore[union-attr]
+            row = ctk.CTkFrame(self.keyword_scroll, fg_color="#F4F6F8" if keyword["enabled"] else "#E4E7E9")
+            row.grid(row=index, column=0, sticky="ew", pady=(0, 6))
+            row.grid_columnconfigure(0, weight=1)
+            label = ctk.CTkLabel(
+                row, text=str(keyword["text"]), anchor="w",
+                text_color="#101820" if keyword["enabled"] else "#8B949B",
+            )
+            label.grid(row=0, column=0, sticky="ew", padx=10, pady=8)
+            var = ctk.BooleanVar(value=bool(keyword["enabled"]))
+            ctk.CTkSwitch(
+                row, text="", width=46, variable=var, progress_color="#00B978",
+                command=lambda i=index, v=var: self.toggle_keyword(i, v.get()),
+            ).grid(row=0, column=1, padx=8)
+            if not keyword["official"]:
+                ctk.CTkButton(
+                    row, text="删除", width=58, fg_color="#7B8790",
+                    command=lambda i=index: self.delete_keyword(i),
+                ).grid(row=0, column=2, padx=(0, 8))
+            self.config_keyword_widgets.append(row)
+
+    def update_selected_category_flags(self) -> None:
+        if self.selected_config_category not in self.config_entries:
+            return
+        entry = self.config_entries[self.selected_config_category]
+        entry["enabled"] = bool(self.config_enabled_var.get())
+        entry["merge_enabled"] = bool(self.config_merge_var.get())
+        self.mark_config_dirty()
+        self.refresh_config_category_list(self.selected_config_category)
+
+    def add_config_category(self) -> None:
+        name = simpledialog.askstring("新增品类", "请输入品类名称：", parent=self.root)
+        if not name:
+            return
+        name = name.strip()
+        if not name or name in self.config_entries:
+            messagebox.showerror(APP_TITLE, "品类名称为空或已经存在。")
+            return
+        self.config_entries[name] = {
+            "official": False, "enabled": True, "merge_enabled": True, "keywords": []
+        }
+        self.config_order.append(name)
+        self.mark_config_dirty()
+        self.refresh_config_category_list(name)
+
+    def delete_config_category(self) -> None:
+        name = self.selected_config_category
+        if not name:
+            return
+        if bool(self.config_entries[name]["official"]):
+            messagebox.showinfo(APP_TITLE, "官方品类不能删除，可以使用启用开关将其停用。")
+            return
+        del self.config_entries[name]
+        self.config_order.remove(name)
+        self.selected_config_category = ""
+        self.mark_config_dirty()
+        self.refresh_config_category_list(self.config_order[0] if self.config_order else "")
+
+    def move_config_category(self, offset: int) -> None:
+        name = self.selected_config_category
+        if name not in self.config_order:
+            return
+        old = self.config_order.index(name)
+        new = max(0, min(len(self.config_order) - 1, old + offset))
+        if new == old:
+            return
+        self.config_order.insert(new, self.config_order.pop(old))
+        self.mark_config_dirty()
+        self.refresh_config_category_list(name)
+
+    def on_category_drag_start(self, event: tk.Event) -> None:
+        self.category_drag_index = self.config_category_list.nearest(event.y)
+
+    def on_category_drag_motion(self, event: tk.Event) -> None:
+        if not hasattr(self, "category_drag_index") or not self.config_order:
+            return
+        target = self.config_category_list.nearest(event.y)
+        source = int(self.category_drag_index)
+        if target == source or target < 0 or target >= len(self.config_order):
+            return
+        name = self.config_order.pop(source)
+        self.config_order.insert(target, name)
+        self.category_drag_index = target
+        self.mark_config_dirty()
+        self.refresh_config_category_list(name)
+
+    def _append_keywords(self, keywords: list[str]) -> None:
+        name = self.selected_config_category
+        if name not in self.config_entries:
+            return
+        rows = self.config_entries[name]["keywords"]  # type: ignore[index]
+        existing = {str(item["text"]).casefold() for item in rows}
+        for keyword in keywords:
+            if keyword.casefold() not in existing:
+                rows.append({"text": keyword, "official": False, "enabled": True})
+                existing.add(keyword.casefold())
+        self.mark_config_dirty()
+        self.refresh_config_detail()
+
+    def add_single_keyword(self) -> None:
+        value = self.keyword_entry.get().strip()
+        if value:
+            self._append_keywords([value])
+            self.keyword_entry.delete(0, "end")
+
+    def add_batch_keywords(self) -> None:
+        values = parse_batch_keywords(self.keyword_batch.get("1.0", "end"))
+        if values:
+            self._append_keywords(values)
+            self.keyword_batch.delete("1.0", "end")
+
+    def toggle_keyword(self, index: int, enabled: bool) -> None:
+        rows = self.config_entries[self.selected_config_category]["keywords"]  # type: ignore[index]
+        rows[index]["enabled"] = bool(enabled)
+        self.mark_config_dirty()
+        self.refresh_config_detail()
+
+    def delete_keyword(self, index: int) -> None:
+        rows = self.config_entries[self.selected_config_category]["keywords"]  # type: ignore[index]
+        if rows[index]["official"]:
+            return
+        rows.pop(index)
+        self.mark_config_dirty()
+        self.refresh_config_detail()
+
+    def build_user_config_from_editor(self) -> dict[str, object]:
+        categories: dict[str, object] = {}
+        for name in self.config_order:
+            entry = self.config_entries[name]
+            keywords = entry["keywords"]  # type: ignore[assignment]
+            if entry["official"]:
+                categories[name] = {
+                    "enabled": bool(entry["enabled"]),
+                    "merge_enabled": bool(entry["merge_enabled"]),
+                    "added_keywords": [item["text"] for item in keywords if not item["official"]],
+                    "disabled_keywords": [item["text"] for item in keywords if item["official"] and not item["enabled"]],
+                }
+            else:
+                categories[name] = {
+                    "custom": True,
+                    "enabled": bool(entry["enabled"]),
+                    "merge_enabled": bool(entry["merge_enabled"]),
+                    "keywords": [item["text"] for item in keywords],
+                    "disabled_keywords": [item["text"] for item in keywords if not item["enabled"]],
+                }
+        return {"version": 1, "category_order": list(self.config_order), "categories": categories}
+
+    def save_config_editor(self) -> bool:
+        official_path = self.base_dir / "config.default.yaml"
+        user_path = self.base_dir / "user_config.yaml"
+        try:
+            official = load_raw_config(official_path)
+            user = self.build_user_config_from_editor()
+            effective = merge_user_config(official, user)
+            validate_config(effective)
+            save_user_config(user_path, user)
+        except (OSError, ValueError, ConfigConflictError) as exc:
+            messagebox.showerror(APP_TITLE, f"配置无法保存：\n{exc}")
+            self.config_status.configure(text="存在冲突或错误", text_color="#9B3417")
+            return False
+        self.config_dirty = False
+        self.config_status.configure(text="已保存", text_color="#176342")
+        messagebox.showinfo(APP_TITLE, f"用户配置已保存：\n{user_path}")
+        return True
+
+    def confirm_discard_config_changes(self) -> bool:
+        if not self.config_dirty:
+            return True
+        answer = messagebox.askyesnocancel(APP_TITLE, "配置有未保存修改。\n\n是：保存\n否：放弃\n取消：继续编辑")
+        if answer is None:
+            return False
+        if answer:
+            return self.save_config_editor()
+        self.config_dirty = False
+        return True
+
+    def on_close(self) -> None:
+        if self.active_page == "config" and not self.confirm_discard_config_changes():
+            return
+        self.root.destroy()
+
+    def check_for_updates_async(self) -> None:
+        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    def _check_for_updates_worker(self) -> None:
+        try:
+            info = fetch_update_info()
+            if is_newer_version(info.version, self.version):
+                self.root.after(0, lambda: self.offer_update(info))
+        except Exception:
+            return
+
+    def offer_update(self, info: object) -> None:
+        version = getattr(info, "version")
+        notes = getattr(info, "notes")
+        note_text = "\n".join(f"• {note}" for note in notes) or "未提供更新说明"
+        if messagebox.askyesno(
+            "发现新版本",
+            f"当前版本：{self.version}\n最新版本：{version}\n\n{note_text}\n\n是否立即更新？",
+        ):
+            if self.background_task_running:
+                messagebox.showwarning(APP_TITLE, "整理任务正在运行，请等待任务完成后再更新。")
+                return
+            threading.Thread(target=self._download_and_start_update, args=(info,), daemon=True).start()
+
+    def _download_and_start_update(self, info: object) -> None:
+        try:
+            package = download_update(info)  # type: ignore[arg-type]
+            updater_exe = self.base_dir / "updater.exe"
+            updater_script = self.base_dir / "updater.py"
+            restart = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
+            if updater_exe.exists():
+                temporary_updater = package.parent / "updater.exe"
+                shutil.copy2(updater_exe, temporary_updater)
+                command = [str(temporary_updater)]
+            elif updater_script.exists():
+                command = [sys.executable, str(updater_script)]
+            else:
+                raise FileNotFoundError("找不到 updater.exe 或 updater.py。")
+            command.extend([
+                "--package", str(package),
+                "--install-dir", str(self.base_dir),
+                "--parent-pid", str(os.getpid()),
+                "--restart", str(restart),
+            ])
+            subprocess.Popen(command, cwd=self.base_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.root.after(0, self.root.destroy)
+        except Exception as exc:
+            message = str(exc)
+            self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"更新失败：\n{message}"))
 
     def _add_path_card(
         self,
@@ -672,6 +1139,7 @@ class LauncherGui:
 
     def _build_action_bar(self, parent: ctk.CTkFrame) -> None:
         bar = ctk.CTkFrame(parent, fg_color="#FFFFFF", corner_radius=0, border_color="#D6DEE5", border_width=1)
+        self.action_bar = bar
         bar.grid(row=1, column=0, sticky="ew")
         bar.grid_columnconfigure(0, weight=1)
         bar.grid_columnconfigure(8, weight=1)
@@ -1043,6 +1511,7 @@ class LauncherGui:
     def start_background_command(self, command: str) -> None:
         log_path = self.base_dir / LAUNCHER_OUTPUT_LOG
         try:
+            self.background_task_running = True
             thread = threading.Thread(
                 target=self.run_hidden_powershell,
                 args=(command, log_path),
@@ -1054,6 +1523,7 @@ class LauncherGui:
                 f"已在后台启动，不会显示 PowerShell 窗口。\n输出日志：\n{log_path}",
             )
         except OSError as exc:
+            self.background_task_running = False
             messagebox.showerror(APP_TITLE, f"无法启动后台任务：\n{exc}")
 
     def run_hidden_powershell(self, command: str, log_path: Path) -> None:
@@ -1090,10 +1560,12 @@ class LauncherGui:
                 finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 log_file.write(f"\n[{finished_at}] 后台任务结束，退出码：{return_code}\n")
         except Exception as exc:
+            self.background_task_running = False
             error_message = str(exc)
             self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"后台任务运行失败：\n{error_message}"))
             return
 
+        self.background_task_running = False
         if return_code == 0:
             self.root.after(
                 0,

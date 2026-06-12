@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.sax.saxutils import escape
 
+from config_manager import ConfigConflictError, load_user_config, merge_user_config
+
 try:
     import yaml
 except ImportError:  # PyYAML is recommended, but the default config has a fallback parser.
@@ -301,7 +303,14 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         raise ConfigError(f"config.yaml 读取失败：{exc}") from exc
     if not isinstance(loaded, dict):
         raise ConfigError("config.yaml 顶层必须是字典。")
-    return deep_merge(DEFAULT_CONFIG, loaded)
+    effective = deep_merge(DEFAULT_CONFIG, loaded)
+    if config_path.name.casefold() == "config.default.yaml":
+        user_path = config_path.with_name("user_config.yaml")
+        try:
+            effective = merge_user_config(effective, load_user_config(user_path))
+        except (ValueError, ConfigConflictError) as exc:
+            raise ConfigError(f"user_config.yaml 读取失败：{exc}") from exc
+    return effective
 
 
 def placeholders(template: str) -> List[str]:
@@ -515,7 +524,7 @@ def check_config_diagnostics(config_path: Path) -> Tuple[int, List[Tuple[str, st
 
 def command_check_config(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description="检查 config.yaml 规则配置")
-    parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="配置文件路径")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("config.default.yaml")), help="配置文件路径")
     args = parser.parse_args(argv)
     exit_code, diagnostics = check_config_diagnostics(Path(args.config).expanduser().resolve())
     print("========== 配置检查 ==========")
@@ -1302,7 +1311,7 @@ def analyze_name(name: str, config: Dict[str, Any]) -> Tuple[WorkItem, CategoryE
 def command_test_name(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description="测试单个文件夹名的识别结果")
     parser.add_argument("name", help="要测试的文件夹名或压缩包外层名")
-    parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="配置文件路径")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("config.default.yaml")), help="配置文件路径")
     args = parser.parse_args(argv)
     try:
         config = load_config(Path(args.config).expanduser().resolve())
@@ -1985,7 +1994,7 @@ def undo_last(root: Path, log_path: Path, run_log_path: Path, confirmed: bool = 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Windows 文件整理自动化脚本 MVP")
     parser.add_argument("--root", required=True, help="需要处理的根目录")
-    parser.add_argument("--config", default=str(Path(__file__).with_name("config.yaml")), help="配置文件路径")
+    parser.add_argument("--config", default=str(Path(__file__).with_name("config.default.yaml")), help="配置文件路径")
     parser.add_argument("--dry-run", action="store_true", help="只预览计划，不执行真实修改")
     parser.add_argument("--apply", action="store_true", help="执行真实整理，执行前仍需输入 YES")
     parser.add_argument("--undo-last", action="store_true", help="撤销最近一次成功或部分成功的 apply 运行")
