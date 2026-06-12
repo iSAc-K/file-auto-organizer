@@ -27,6 +27,7 @@ from launcher_core import (
     PREVIEW_COLUMN_WIDTHS,
     SETTINGS_NAME,
     LauncherSettings,
+    OperationGate,
     app_base_dir,
     build_command,
     build_preview_rows,
@@ -46,7 +47,7 @@ from launcher_core import (
 )
 
 
-APP_TITLE = "Windows 文件整理助手 v2.4.1"
+APP_TITLE = "Windows 文件整理助手 v2.4.2"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 
 MODE_LABELS = {
@@ -68,7 +69,7 @@ class LauncherGui:
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
-        self.version = read_version(self.base_dir) or "2.4.1"
+        self.version = read_version(self.base_dir) or "2.4.2"
         settings = self.load_settings()
         self._initializing = True
 
@@ -95,7 +96,7 @@ class LauncherGui:
         self.config_order: list[str] = []
         self.selected_config_category = ""
         self.config_keyword_widgets: list[ctk.CTkFrame] = []
-        self.background_task_running = False
+        self.operation_gate = OperationGate()
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -764,8 +765,8 @@ class LauncherGui:
             "发现新版本",
             f"当前版本：{self.version}\n最新版本：{version}\n\n{note_text}\n\n是否立即更新？",
         ):
-            if self.background_task_running:
-                messagebox.showwarning(APP_TITLE, "整理任务正在运行，请等待任务完成后再更新。")
+            if not self.operation_gate.begin_update():
+                messagebox.showwarning(APP_TITLE, "整理任务或更新正在运行，请等待完成后再试。")
                 return
             threading.Thread(target=self._download_and_start_update, args=(info,), daemon=True).start()
 
@@ -792,6 +793,7 @@ class LauncherGui:
             subprocess.Popen(command, cwd=self.base_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self.root.after(0, self.root.destroy)
         except Exception as exc:
+            self.operation_gate.end_update()
             message = str(exc)
             self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"更新失败：\n{message}"))
 
@@ -1510,8 +1512,10 @@ class LauncherGui:
 
     def start_background_command(self, command: str) -> None:
         log_path = self.base_dir / LAUNCHER_OUTPUT_LOG
+        if not self.operation_gate.begin_task():
+            messagebox.showwarning(APP_TITLE, "更新或其他整理任务正在运行，请等待完成后再试。")
+            return
         try:
-            self.background_task_running = True
             thread = threading.Thread(
                 target=self.run_hidden_powershell,
                 args=(command, log_path),
@@ -1523,7 +1527,7 @@ class LauncherGui:
                 f"已在后台启动，不会显示 PowerShell 窗口。\n输出日志：\n{log_path}",
             )
         except OSError as exc:
-            self.background_task_running = False
+            self.operation_gate.end_task()
             messagebox.showerror(APP_TITLE, f"无法启动后台任务：\n{exc}")
 
     def run_hidden_powershell(self, command: str, log_path: Path) -> None:
@@ -1560,12 +1564,12 @@ class LauncherGui:
                 finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 log_file.write(f"\n[{finished_at}] 后台任务结束，退出码：{return_code}\n")
         except Exception as exc:
-            self.background_task_running = False
+            self.operation_gate.end_task()
             error_message = str(exc)
             self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"后台任务运行失败：\n{error_message}"))
             return
 
-        self.background_task_running = False
+        self.operation_gate.end_task()
         if return_code == 0:
             self.root.after(
                 0,

@@ -88,7 +88,15 @@ def merge_user_config(official: dict[str, Any], user: dict[str, Any]) -> dict[st
         if not enabled:
             continue
         if is_custom:
-            keywords = _unique(list(override.get("keywords", []) or []))
+            disabled = {
+                str(value).strip().casefold()
+                for value in override.get("disabled_keywords", []) or []
+            }
+            keywords = _unique([
+                value
+                for value in override.get("keywords", []) or []
+                if str(value).strip().casefold() not in disabled
+            ])
             merge_enabled = bool(override.get("merge_enabled", True))
         else:
             base = official_categories[name]

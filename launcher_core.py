@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
+import threading
 from typing import Any, Literal, cast
 
 
@@ -25,6 +26,35 @@ PREVIEW_COLUMN_WIDTHS = {
 }
 PREVIEW_COLUMN_MAX_WIDTH = 600
 PREVIEW_COLUMN_PADDING = 24
+
+
+class OperationGate:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._task_running = False
+        self._update_running = False
+
+    def begin_task(self) -> bool:
+        with self._lock:
+            if self._task_running or self._update_running:
+                return False
+            self._task_running = True
+            return True
+
+    def end_task(self) -> None:
+        with self._lock:
+            self._task_running = False
+
+    def begin_update(self) -> bool:
+        with self._lock:
+            if self._task_running or self._update_running:
+                return False
+            self._update_running = True
+            return True
+
+    def end_update(self) -> None:
+        with self._lock:
+            self._update_running = False
 
 
 @dataclass(frozen=True)

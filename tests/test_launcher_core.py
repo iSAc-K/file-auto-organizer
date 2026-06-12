@@ -5,6 +5,7 @@ import unittest
 
 from launcher_core import (
     LauncherSettings,
+    OperationGate,
     PREVIEW_COLUMN_MAX_WIDTH,
     PREVIEW_COLUMN_PADDING,
     PREVIEW_COLUMN_WIDTHS,
@@ -26,6 +27,17 @@ from launcher_core import (
 
 
 class LauncherCoreTests(unittest.TestCase):
+    def test_operation_gate_prevents_update_and_organizer_overlap(self):
+        gate = OperationGate()
+
+        self.assertTrue(gate.begin_update())
+        self.assertFalse(gate.begin_task())
+        gate.end_update()
+        self.assertTrue(gate.begin_task())
+        self.assertFalse(gate.begin_update())
+        gate.end_task()
+        self.assertTrue(gate.begin_update())
+
     def test_preview_column_widths_match_defaults(self):
         self.assertEqual(
             PREVIEW_COLUMN_WIDTHS,

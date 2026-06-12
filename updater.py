@@ -52,8 +52,8 @@ def apply_update_package(package: Path, install_dir: Path) -> None:
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(target, backup)
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
             replaced.append(relative)
+            shutil.copy2(source, target)
     except Exception:
         for relative in reversed(replaced):
             target = install_dir / relative

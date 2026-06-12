@@ -92,6 +92,24 @@ class ConfigManagerTests(unittest.TestCase):
         merged = merge_user_config(OFFICIAL, user)
         self.assertEqual(merged["categories"]["C"]["keywords"], ["alpha"])
 
+    def test_disabled_custom_keyword_is_removed_from_effective_config(self):
+        user = {
+            "category_order": ["C"],
+            "categories": {
+                "C": {
+                    "custom": True,
+                    "enabled": True,
+                    "merge_enabled": True,
+                    "keywords": ["active", "disabled"],
+                    "disabled_keywords": ["disabled"],
+                }
+            },
+        }
+
+        merged = merge_user_config({"category_priority": [], "categories": {}}, user)
+
+        self.assertEqual(merged["categories"]["C"]["keywords"], ["active"])
+
     def test_batch_keywords_support_commas_chinese_commas_and_lines(self):
         self.assertEqual(
             parse_batch_keywords(" alpha, beta，gamma\nalpha \n"),
