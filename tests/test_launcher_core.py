@@ -13,8 +13,13 @@ from launcher_core import (
     build_preview_rows,
     build_safety_status_text,
     build_update_status_text,
+    can_cancel_update,
+    can_close_update_window,
     clean_path_value,
     find_latest_report,
+    format_byte_count,
+    format_download_speed,
+    format_remaining_time,
     format_python_command,
     load_settings,
     ps_quote,
@@ -28,6 +33,33 @@ from launcher_core import (
 
 
 class LauncherCoreTests(unittest.TestCase):
+    def test_update_progress_formats_byte_counts_and_speed(self):
+        self.assertEqual(format_byte_count(0), "0 B")
+        self.assertEqual(format_byte_count(1536), "1.5 KB")
+        self.assertEqual(format_byte_count(5 * 1024 * 1024), "5.0 MB")
+        self.assertEqual(format_download_speed(1536), "1.5 KB/s")
+
+    def test_update_progress_formats_remaining_time(self):
+        self.assertEqual(format_remaining_time(None), "计算中")
+        self.assertEqual(format_remaining_time(4.2), "约 5 秒")
+        self.assertEqual(format_remaining_time(75), "约 2 分钟")
+
+    def test_update_window_action_rules_match_status(self):
+        for status in ("downloading", "verifying"):
+            with self.subTest(status=status):
+                self.assertTrue(can_cancel_update(status))
+                self.assertFalse(can_close_update_window(status))
+
+        for status in ("preparing_install", "updater_started"):
+            with self.subTest(status=status):
+                self.assertFalse(can_cancel_update(status))
+                self.assertFalse(can_close_update_window(status))
+
+        for status in ("checking", "available", "latest", "failed", "cancelled"):
+            with self.subTest(status=status):
+                self.assertFalse(can_cancel_update(status))
+                self.assertTrue(can_close_update_window(status))
+
     def test_update_status_text_covers_manual_check_states(self):
         self.assertIn("正在检查", build_update_status_text("checking", "2.4.3"))
         self.assertIn("已是最新版本", build_update_status_text("latest", "2.4.3", "2.4.3"))
@@ -42,6 +74,20 @@ class LauncherCoreTests(unittest.TestCase):
         self.assertIn("新增手动检查更新", available)
         self.assertIn("检查更新失败", build_update_status_text("failed", "2.4.3", error="网络超时"))
         self.assertIn("正在下载", build_update_status_text("downloading", "2.4.3", "2.4.4"))
+
+    def test_update_status_text_covers_visual_update_states(self):
+        verifying = build_update_status_text("verifying", "2.4.3", "2.4.4")
+        cancelled = build_update_status_text("cancelled", "2.4.3", "2.4.4")
+        preparing = build_update_status_text("preparing_install", "2.4.3", "2.4.4")
+        started = build_update_status_text("updater_started", "2.4.3", "2.4.4")
+
+        self.assertIn("校验", verifying)
+        self.assertIn("已取消", cancelled)
+        self.assertIn("准备安装", preparing)
+        self.assertIn("更新程序", started)
+        for text in (verifying, cancelled, preparing, started):
+            self.assertIn("2.4.3", text)
+            self.assertIn("2.4.4", text)
 
     def test_operation_gate_prevents_update_and_organizer_overlap(self):
         gate = OperationGate()

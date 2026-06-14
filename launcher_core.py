@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import sys
 import threading
@@ -10,7 +11,17 @@ from typing import Any, Literal, cast
 
 SETTINGS_NAME = "launcher_settings.json"
 Mode = Literal["dry-run", "apply", "undo-last"]
-UpdateStatus = Literal["checking", "latest", "available", "failed", "downloading"]
+UpdateStatus = Literal[
+    "checking",
+    "latest",
+    "available",
+    "downloading",
+    "verifying",
+    "cancelled",
+    "failed",
+    "preparing_install",
+    "updater_started",
+]
 VALID_MODES: set[str] = {"dry-run", "apply", "undo-last"}
 PREVIEW_COLUMN_WIDTHS = {
     "序号": 48,
@@ -227,6 +238,26 @@ def build_update_status_text(
     notes: list[str] | None = None,
     error: str = "",
 ) -> str:
+    if status == "verifying":
+        return (
+            f"正在校验更新文件...\n\n当前版本：{current_version}\n"
+            f"目标版本：{latest_version}"
+        )
+    if status == "cancelled":
+        return (
+            f"更新已取消。\n\n当前版本：{current_version}\n"
+            f"目标版本：{latest_version}"
+        )
+    if status == "preparing_install":
+        return (
+            f"正在准备安装更新...\n\n当前版本：{current_version}\n"
+            f"目标版本：{latest_version}"
+        )
+    if status == "updater_started":
+        return (
+            f"更新程序已启动。\n\n当前版本：{current_version}\n"
+            f"目标版本：{latest_version}"
+        )
     if status == "checking":
         return f"正在检查更新…\n\n当前版本：{current_version}"
     if status == "latest":
@@ -247,6 +278,38 @@ def build_update_status_text(
         f"检查更新失败。\n\n当前版本：{current_version}\n"
         f"失败原因：{error or '未知错误'}\n\n可以点击“重新检查”再次尝试。"
     )
+
+
+def format_byte_count(byte_count: int | float) -> str:
+    value = max(0.0, float(byte_count))
+    if value < 1024:
+        return f"{int(value)} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        value /= 1024
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+    raise AssertionError("unreachable")
+
+
+def format_download_speed(bytes_per_second: int | float) -> str:
+    return f"{format_byte_count(bytes_per_second)}/s"
+
+
+def format_remaining_time(seconds: int | float | None) -> str:
+    if seconds is None:
+        return "计算中"
+    rounded_seconds = max(0, math.ceil(seconds))
+    if rounded_seconds < 60:
+        return f"约 {rounded_seconds} 秒"
+    return f"约 {math.ceil(rounded_seconds / 60)} 分钟"
+
+
+def can_cancel_update(status: UpdateStatus) -> bool:
+    return status in {"downloading", "verifying"}
+
+
+def can_close_update_window(status: UpdateStatus) -> bool:
+    return status in {"checking", "available", "latest", "failed", "cancelled"}
 
 
 def wheel_delta_to_units(delta: int) -> int:
