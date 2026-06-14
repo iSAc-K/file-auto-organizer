@@ -383,6 +383,49 @@ class UpdateManagerTests(unittest.TestCase):
 
         self.assertFalse(Path(tmp).exists())
 
+    def test_cancel_during_final_clock_skips_verified_and_removes_temp_dir(self):
+        payload = b"payload"
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            hashlib.sha256(payload).hexdigest(),
+            [],
+        )
+        cancel = threading.Event()
+        events: list[DownloadProgress] = []
+        clock_calls = 0
+
+        def cancel_on_final_clock() -> float:
+            nonlocal clock_calls
+            clock_calls += 1
+            if clock_calls == 5:
+                cancel.set()
+            return float(clock_calls)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = self.download_directory(tmp)
+            with (
+                patch(
+                    "update_manager.urllib.request.urlopen",
+                    return_value=FakeResponse(payload, str(len(payload))),
+                ),
+                patch("update_manager.tempfile.mkdtemp", return_value=str(download_dir)),
+            ):
+                with self.assertRaises(UpdateCancelled) as caught:
+                    download_update(
+                        info,
+                        cancel_event=cancel,
+                        progress_callback=events.append,
+                        clock=cancel_on_final_clock,
+                    )
+
+            self.assertEqual(clock_calls, 5)
+            self.assertNotIn("verified", [event.phase for event in events])
+            self.assertFalse(caught.exception.path.exists())
+            self.assertFalse(download_dir.exists())
+
+        self.assertFalse(Path(tmp).exists())
+
     def test_verify_sha256_reports_before_and_during_reading(self):
         payload = b"x" * (1024 * 1024 + 4)
         events: list[DownloadProgress] = []

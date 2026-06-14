@@ -234,6 +234,7 @@ def download_update(
             raise ValueError("更新包 SHA-256 校验失败。")
         _raise_if_cancelled(cancel_event, target)
         elapsed = max(0.0, clock() - started_at)
+        _raise_if_cancelled(cancel_event, target)
         _report_progress(
             progress_callback,
             _build_progress(
