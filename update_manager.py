@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import tempfile
 import threading
 import time
@@ -150,39 +151,35 @@ def verify_sha256(
     total_bytes: int | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> bool:
-    try:
-        digest = hashlib.sha256()
-        verified_bytes = 0
-        started_at = clock()
-        _raise_if_cancelled(cancel_event, path)
-        _report_progress(
-            progress_callback,
-            _build_progress("verifying", 0, total_bytes, 0.0),
-        )
-        _raise_if_cancelled(cancel_event, path)
-        with path.open("rb") as file:
-            while True:
-                _raise_if_cancelled(cancel_event, path)
-                chunk = file.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                verified_bytes += len(chunk)
-                elapsed = max(0.0, clock() - started_at)
-                _report_progress(
-                    progress_callback,
-                    _build_progress(
-                        "verifying",
-                        verified_bytes,
-                        total_bytes,
-                        elapsed,
-                    ),
-                )
-                _raise_if_cancelled(cancel_event, path)
-        return digest.hexdigest().casefold() == expected.strip().casefold()
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+    digest = hashlib.sha256()
+    verified_bytes = 0
+    started_at = clock()
+    _raise_if_cancelled(cancel_event, path)
+    _report_progress(
+        progress_callback,
+        _build_progress("verifying", 0, total_bytes, 0.0),
+    )
+    _raise_if_cancelled(cancel_event, path)
+    with path.open("rb") as file:
+        while True:
+            _raise_if_cancelled(cancel_event, path)
+            chunk = file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            verified_bytes += len(chunk)
+            elapsed = max(0.0, clock() - started_at)
+            _report_progress(
+                progress_callback,
+                _build_progress(
+                    "verifying",
+                    verified_bytes,
+                    total_bytes,
+                    elapsed,
+                ),
+            )
+            _raise_if_cancelled(cancel_event, path)
+    return digest.hexdigest().casefold() == expected.strip().casefold()
 
 
 def download_update(
@@ -195,12 +192,16 @@ def download_update(
 ) -> Path:
     if chunk_size < 1:
         raise ValueError("下载块大小必须是正整数。")
-    target = Path(tempfile.mkdtemp(prefix="file-organizer-update-")) / "update.zip"
-    request = urllib.request.Request(info.download_url, headers={"User-Agent": "WindowsFileOrganizer-Updater"})
-    started_at = clock()
-    downloaded = 0
-    total_bytes = None
+    temp_dir = Path(tempfile.mkdtemp(prefix="file-organizer-update-"))
+    target = temp_dir / "update.zip"
     try:
+        request = urllib.request.Request(
+            info.download_url,
+            headers={"User-Agent": "WindowsFileOrganizer-Updater"},
+        )
+        started_at = clock()
+        downloaded = 0
+        total_bytes = None
         _raise_if_cancelled(cancel_event, target)
         with urllib.request.urlopen(request, timeout=timeout) as response, target.open("wb") as output:
             total_bytes = _content_length(response)
@@ -231,6 +232,7 @@ def download_update(
             clock=clock,
         ):
             raise ValueError("更新包 SHA-256 校验失败。")
+        _raise_if_cancelled(cancel_event, target)
         elapsed = max(0.0, clock() - started_at)
         _report_progress(
             progress_callback,
@@ -242,6 +244,6 @@ def download_update(
             ),
         )
     except Exception:
-        target.unlink(missing_ok=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
         raise
     return target

@@ -46,6 +46,32 @@ class ControlledClock:
         return self.last
 
 
+class FailingReader:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, _size: int) -> bytes:
+        raise RuntimeError("read failed")
+
+
+class DeferredCancelEvent:
+    def __init__(self):
+        self.armed = False
+        self.checks_after_arm = 0
+
+    def set(self) -> None:
+        self.armed = True
+
+    def is_set(self) -> bool:
+        if not self.armed:
+            return False
+        self.checks_after_arm += 1
+        return self.checks_after_arm >= 3
+
+
 class UpdateManagerTests(unittest.TestCase):
     def download_directory(self, root: str) -> Path:
         directory = Path(root) / "download"
@@ -121,7 +147,34 @@ class UpdateManagerTests(unittest.TestCase):
             self.assertEqual(download_events[-1].average_bytes_per_second, 3.0)
             self.assertEqual(download_events[-1].estimated_seconds_remaining, 0.0)
             self.assertEqual(events[-1].phase, "verified")
+            self.assertTrue(download_dir.exists())
             path.unlink()
+            download_dir.rmdir()
+
+        self.assertFalse(Path(tmp).exists())
+
+    def test_download_initial_clock_error_removes_temp_dir_and_propagates(self):
+        payload = b"payload"
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            hashlib.sha256(payload).hexdigest(),
+            [],
+        )
+
+        def fail_clock() -> float:
+            raise RuntimeError("clock failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = self.download_directory(tmp)
+            with patch(
+                "update_manager.tempfile.mkdtemp",
+                return_value=str(download_dir),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "clock failed"):
+                    download_update(info, clock=fail_clock)
+
+            self.assertFalse(download_dir.exists())
 
         self.assertFalse(Path(tmp).exists())
 
@@ -154,6 +207,7 @@ class UpdateManagerTests(unittest.TestCase):
                 )
             )
             path.unlink()
+            download_dir.rmdir()
 
         self.assertFalse(Path(tmp).exists())
 
@@ -188,6 +242,7 @@ class UpdateManagerTests(unittest.TestCase):
                     ]
                     self.assertIsNone(download_events[-1].total_bytes)
                     path.unlink()
+                    download_dir.rmdir()
 
                 self.assertFalse(Path(tmp).exists())
 
@@ -223,7 +278,7 @@ class UpdateManagerTests(unittest.TestCase):
                     )
 
             self.assertFalse(caught.exception.path.exists())
-            self.assertEqual(list(download_dir.iterdir()), [])
+            self.assertFalse(download_dir.exists())
 
         self.assertFalse(Path(tmp).exists())
 
@@ -259,7 +314,7 @@ class UpdateManagerTests(unittest.TestCase):
                     )
 
             self.assertFalse(caught.exception.path.exists())
-            self.assertEqual(list(download_dir.iterdir()), [])
+            self.assertFalse(download_dir.exists())
 
         self.assertFalse(Path(tmp).exists())
 
@@ -284,7 +339,47 @@ class UpdateManagerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     download_update(info)
 
-            self.assertEqual(list(download_dir.iterdir()), [])
+            self.assertFalse(download_dir.exists())
+
+        self.assertFalse(Path(tmp).exists())
+
+    def test_cancel_after_final_verifying_event_skips_verified_and_removes_temp_dir(self):
+        payload = b"payload"
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            hashlib.sha256(payload).hexdigest(),
+            [],
+        )
+        cancel = DeferredCancelEvent()
+        events: list[DownloadProgress] = []
+
+        def cancel_after_final_verifying(event: DownloadProgress) -> None:
+            events.append(event)
+            if (
+                event.phase == "verifying"
+                and event.downloaded_bytes == len(payload)
+            ):
+                cancel.set()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = self.download_directory(tmp)
+            with (
+                patch(
+                    "update_manager.urllib.request.urlopen",
+                    return_value=FakeResponse(payload, str(len(payload))),
+                ),
+                patch("update_manager.tempfile.mkdtemp", return_value=str(download_dir)),
+            ):
+                with self.assertRaises(UpdateCancelled):
+                    download_update(
+                        info,
+                        cancel_event=cancel,
+                        progress_callback=cancel_after_final_verifying,
+                    )
+
+            self.assertNotIn("verified", [event.phase for event in events])
+            self.assertFalse(download_dir.exists())
 
         self.assertFalse(Path(tmp).exists())
 
@@ -310,7 +405,7 @@ class UpdateManagerTests(unittest.TestCase):
             [0, 1024 * 1024, len(payload)],
         )
 
-    def test_verify_sha256_callback_error_deletes_archive_and_propagates(self):
+    def test_verify_sha256_callback_error_preserves_archive_and_propagates(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "update.zip"
             path.write_bytes(b"payload")
@@ -325,9 +420,9 @@ class UpdateManagerTests(unittest.TestCase):
                     progress_callback=fail_progress,
                 )
 
-            self.assertFalse(path.exists())
+            self.assertTrue(path.exists())
 
-    def test_verify_sha256_initial_clock_error_deletes_archive_and_propagates(self):
+    def test_verify_sha256_initial_clock_error_preserves_archive_and_propagates(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "update.zip"
             path.write_bytes(b"payload")
@@ -342,7 +437,55 @@ class UpdateManagerTests(unittest.TestCase):
                     clock=fail_clock,
                 )
 
-            self.assertFalse(path.exists())
+            self.assertTrue(path.exists())
+
+    def test_verify_sha256_read_error_preserves_archive_and_propagates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "update.zip"
+            path.write_bytes(b"payload")
+
+            with (
+                patch.object(Path, "open", return_value=FailingReader()),
+                self.assertRaisesRegex(RuntimeError, "read failed"),
+            ):
+                verify_sha256(
+                    path,
+                    hashlib.sha256(b"payload").hexdigest(),
+                )
+
+            self.assertTrue(path.exists())
+
+    def test_verify_sha256_zero_or_backward_clock_reports_zero_speed(self):
+        payload = b"x" * (1024 * 1024 + 4)
+
+        for times in ((10.0, 10.0, 10.0), (10.0, 9.0, 8.0)):
+            with self.subTest(times=times):
+                events: list[DownloadProgress] = []
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "update.zip"
+                    path.write_bytes(payload)
+                    self.assertTrue(
+                        verify_sha256(
+                            path,
+                            hashlib.sha256(payload).hexdigest(),
+                            progress_callback=events.append,
+                            total_bytes=len(payload),
+                            clock=ControlledClock(*times),
+                        )
+                    )
+
+                self.assertEqual(
+                    [event.elapsed_seconds for event in events],
+                    [0.0, 0.0, 0.0],
+                )
+                self.assertEqual(
+                    [event.average_bytes_per_second for event in events],
+                    [0.0, 0.0, 0.0],
+                )
+                self.assertEqual(
+                    [event.estimated_seconds_remaining for event in events],
+                    [None, None, None],
+                )
 
     def test_utf8_bom_manifest_can_be_decoded(self):
         payload = b"\xef\xbb\xbf" + json.dumps(
