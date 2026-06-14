@@ -37,6 +37,7 @@ temp_*/
 
 # Local environment
 .superpowers/
+.worktrees/
 .tools/
 .venv/
 venv/
