@@ -8,6 +8,8 @@ import sys
 import threading
 from typing import Any, Literal, cast
 
+from update_manager import DownloadProgress
+
 
 SETTINGS_NAME = "launcher_settings.json"
 Mode = Literal["dry-run", "apply", "undo-last"]
@@ -102,6 +104,16 @@ class ValidationResult:
     script_path: Path
     root_path: Path
     config_path: Path | None
+
+
+@dataclass(frozen=True)
+class UpdateProgressText:
+    downloaded: str
+    speed: str
+    remaining: str
+    percent: str
+    value: float
+    indeterminate: bool
 
 
 def app_base_dir() -> Path:
@@ -303,6 +315,30 @@ def format_remaining_time(seconds: int | float | None) -> str:
     if rounded_seconds < 60:
         return f"约 {rounded_seconds} 秒"
     return f"约 {math.ceil(rounded_seconds / 60)} 分钟"
+
+
+def build_update_progress_text(progress: DownloadProgress) -> UpdateProgressText:
+    downloaded = format_byte_count(progress.downloaded_bytes)
+    speed = format_download_speed(progress.average_bytes_per_second)
+    remaining = format_remaining_time(progress.estimated_seconds_remaining)
+    if progress.total_bytes is None:
+        return UpdateProgressText(
+            downloaded=downloaded,
+            speed=speed,
+            remaining=remaining,
+            percent="下载中",
+            value=0,
+            indeterminate=True,
+        )
+    value = min(1.0, max(0.0, progress.downloaded_bytes / progress.total_bytes))
+    return UpdateProgressText(
+        downloaded=f"{downloaded} / {format_byte_count(progress.total_bytes)}",
+        speed=speed,
+        remaining=remaining,
+        percent=f"{round(value * 100)}%",
+        value=value,
+        indeterminate=False,
+    )
 
 
 def can_cancel_update(status: UpdateStatus) -> bool:

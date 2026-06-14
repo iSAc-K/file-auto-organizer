@@ -13,6 +13,7 @@ from launcher_core import (
     build_preview_rows,
     build_safety_status_text,
     build_update_status_text,
+    build_update_progress_text,
     can_cancel_update,
     can_close_update_window,
     clean_path_value,
@@ -30,9 +31,48 @@ from launcher_core import (
     default_window_geometry,
     wheel_delta_to_units,
 )
+from update_manager import DownloadProgress
 
 
 class LauncherCoreTests(unittest.TestCase):
+    def test_build_update_progress_text_for_known_total(self):
+        progress = DownloadProgress(
+            phase="downloading",
+            downloaded_bytes=5 * 1024 * 1024,
+            total_bytes=20 * 1024 * 1024,
+            elapsed_seconds=2.5,
+            average_bytes_per_second=2 * 1024 * 1024,
+            estimated_seconds_remaining=7.6,
+        )
+
+        text = build_update_progress_text(progress)
+
+        self.assertEqual(text.downloaded, "5.0 MB / 20.0 MB")
+        self.assertEqual(text.speed, "2.0 MB/s")
+        self.assertEqual(text.remaining, "约 8 秒")
+        self.assertEqual(text.percent, "25%")
+        self.assertEqual(text.value, 0.25)
+        self.assertFalse(text.indeterminate)
+
+    def test_build_update_progress_text_for_unknown_total(self):
+        progress = DownloadProgress(
+            phase="downloading",
+            downloaded_bytes=5 * 1024 * 1024,
+            total_bytes=None,
+            elapsed_seconds=2.5,
+            average_bytes_per_second=2 * 1024 * 1024,
+            estimated_seconds_remaining=None,
+        )
+
+        text = build_update_progress_text(progress)
+
+        self.assertEqual(text.downloaded, "5.0 MB")
+        self.assertEqual(text.speed, "2.0 MB/s")
+        self.assertEqual(text.remaining, "计算中")
+        self.assertEqual(text.percent, "下载中")
+        self.assertEqual(text.value, 0)
+        self.assertTrue(text.indeterminate)
+
     def test_update_progress_formats_byte_counts_and_speed(self):
         self.assertEqual(format_byte_count(0), "0 B")
         self.assertEqual(format_byte_count(1536), "1.5 KB")

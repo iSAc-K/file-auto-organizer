@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -22,7 +23,13 @@ from config_manager import (
     save_user_config,
 )
 from file_helper import load_raw_config, validate_config
-from update_manager import download_update, fetch_update_info_with_retry, is_newer_version
+from update_manager import (
+    DownloadProgress,
+    UpdateCancelled,
+    download_update,
+    fetch_update_info_with_retry,
+    is_newer_version,
+)
 from launcher_core import (
     PREVIEW_COLUMN_WIDTHS,
     SETTINGS_NAME,
@@ -32,7 +39,9 @@ from launcher_core import (
     build_command,
     build_preview_rows,
     build_safety_status_text,
+    build_update_progress_text,
     build_update_status_text,
+    can_close_update_window,
     clean_path_value,
     default_window_geometry,
     default_settings,
@@ -102,6 +111,20 @@ class LauncherGui:
         self.update_window: ctk.CTkToplevel | None = None
         self.update_status_label: ctk.CTkLabel | None = None
         self.update_action_button: ctk.CTkButton | None = None
+        self.update_progress_bar: ctk.CTkProgressBar | None = None
+        self.update_percent_label: ctk.CTkLabel | None = None
+        self.update_downloaded_label: ctk.CTkLabel | None = None
+        self.update_speed_label: ctk.CTkLabel | None = None
+        self.update_remaining_label: ctk.CTkLabel | None = None
+        self.update_stage_labels: list[ctk.CTkLabel] = []
+        self.update_status = "latest"
+        self.update_latest_version = ""
+        self.update_cancel_event: threading.Event | None = None
+        self.pending_update_progress: DownloadProgress | None = None
+        self.pending_update_results: list[tuple[str, str]] = []
+        self.last_progress_phase = ""
+        self.last_progress_refresh = 0.0
+        self.update_overlay: ctk.CTkFrame | None = None
         self.manual_update_info: object | None = None
         self.manual_update_check_running = False
 
@@ -762,6 +785,9 @@ class LauncherGui:
         return True
 
     def on_close(self) -> None:
+        if self.update_status in {"downloading", "verifying", "preparing_install", "updater_started"}:
+            self._raise_update_window()
+            return
         if self.active_page == "config" and not self.confirm_discard_config_changes():
             return
         self.root.destroy()
@@ -786,29 +812,51 @@ class LauncherGui:
         except Exception as exc:
             self._log_update_check_failure(exc)
 
-    def open_update_window(self) -> None:
+    def open_update_window(self, start_check: bool = True) -> None:
         if self.update_window is not None and self.update_window.winfo_exists():
-            self.update_window.lift()
-            self.update_window.focus_force()
+            self._raise_update_window()
             return
 
         window = ctk.CTkToplevel(self.root)
         self.update_window = window
         window.title("检查更新")
-        window.geometry("520x390")
+        window.geometry("560x500")
         window.resizable(False, False)
         window.transient(self.root)
         window.configure(fg_color="#EEF2F4")
         window.grid_columnconfigure(0, weight=1)
-        window.grid_rowconfigure(1, weight=1)
+        window.grid_rowconfigure(2, weight=1)
         window.protocol("WM_DELETE_WINDOW", self.close_update_window)
 
+        heading = ctk.CTkFrame(window, fg_color="transparent")
+        heading.grid(row=0, column=0, sticky="ew", padx=28, pady=(24, 12))
+        heading.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            window,
-            text="软件更新",
-            text_color="#101820",
+            heading, text="软件更新", text_color="#101820",
             font=ctk.CTkFont(size=24, weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=28, pady=(26, 12))
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            heading, text=f"当前版本  v{self.version}", text_color="#6A7884",
+            font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=1, sticky="e")
+
+        stages = ctk.CTkFrame(window, fg_color="transparent")
+        stages.grid(row=1, column=0, sticky="ew", padx=28, pady=(0, 12))
+        for column in range(4):
+            stages.grid_columnconfigure(column, weight=1)
+        self.update_stage_labels = []
+        for column, text in enumerate(("下载更新", "校验文件", "准备安装", "安装更新")):
+            label = ctk.CTkLabel(
+                stages,
+                text=text,
+                text_color="#7B8790",
+                fg_color="#E2E7EA",
+                corner_radius=6,
+                height=28,
+                font=ctk.CTkFont(size=12, weight="bold"),
+            )
+            label.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 4, 0))
+            self.update_stage_labels.append(label)
 
         status_card = ctk.CTkFrame(
             window,
@@ -817,19 +865,40 @@ class LauncherGui:
             border_width=1,
             corner_radius=10,
         )
-        status_card.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 16))
+        status_card.grid(row=2, column=0, sticky="nsew", padx=28, pady=(0, 16))
         status_card.grid_columnconfigure(0, weight=1)
-        status_card.grid_rowconfigure(0, weight=1)
+        status_card.grid_columnconfigure(1, weight=0)
         self.update_status_label = ctk.CTkLabel(
             status_card,
             text="",
             text_color="#33414C",
             justify="left",
             anchor="nw",
-            wraplength=410,
-            font=ctk.CTkFont(size=14),
+            wraplength=440,
+            font=ctk.CTkFont(size=13),
         )
-        self.update_status_label.grid(row=0, column=0, sticky="nsew", padx=22, pady=20)
+        self.update_status_label.grid(row=0, column=0, columnspan=2, sticky="ew", padx=22, pady=(18, 10))
+        self.update_progress_bar = ctk.CTkProgressBar(
+            status_card,
+            height=12,
+            progress_color="#F05A28",
+            fg_color="#DDE3E7",
+        )
+        self.update_progress_bar.grid(row=1, column=0, sticky="ew", padx=(22, 10), pady=(0, 8))
+        self.update_progress_bar.set(0)
+        self.update_percent_label = ctk.CTkLabel(
+            status_card, text="0%", width=54, anchor="e",
+            text_color="#101820", font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.update_percent_label.grid(row=1, column=1, sticky="e", padx=(0, 22), pady=(0, 8))
+
+        metrics = ctk.CTkFrame(status_card, fg_color="#F5F7F8", corner_radius=8)
+        metrics.grid(row=2, column=0, columnspan=2, sticky="ew", padx=22, pady=(0, 16))
+        for column in range(3):
+            metrics.grid_columnconfigure(column, weight=1)
+        self.update_downloaded_label = self._build_update_metric(metrics, 0, "已下载", "0 B")
+        self.update_speed_label = self._build_update_metric(metrics, 1, "平均速度", "0 B/s")
+        self.update_remaining_label = self._build_update_metric(metrics, 2, "剩余时间", "计算中")
 
         self.update_action_button = ctk.CTkButton(
             window,
@@ -841,16 +910,51 @@ class LauncherGui:
             hover_color="#D94C1D",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.update_action_button.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 26))
+        self.update_action_button.grid(row=3, column=0, sticky="ew", padx=28, pady=(0, 26))
         window.after(50, window.lift)
-        self.start_manual_update_check()
+        window.after(250, self._poll_update_progress)
+        if start_check:
+            self.start_manual_update_check()
+
+    def _build_update_metric(
+        self,
+        parent: ctk.CTkFrame,
+        column: int,
+        title: str,
+        value: str,
+    ) -> ctk.CTkLabel:
+        cell = ctk.CTkFrame(parent, fg_color="transparent")
+        cell.grid(row=0, column=column, sticky="ew", padx=10, pady=10)
+        ctk.CTkLabel(
+            cell, text=title, text_color="#7B8790", font=ctk.CTkFont(size=11),
+        ).pack(anchor="w")
+        label = ctk.CTkLabel(
+            cell, text=value, text_color="#33414C",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        label.pack(anchor="w", pady=(2, 0))
+        return label
+
+    def _raise_update_window(self) -> None:
+        if self._update_window_is_open():
+            self.update_window.lift()
+            self.update_window.focus_force()
 
     def close_update_window(self) -> None:
+        if not can_close_update_window(self.update_status):  # type: ignore[arg-type]
+            self._raise_update_window()
+            return
         if self.update_window is not None:
             self.update_window.destroy()
         self.update_window = None
         self.update_status_label = None
         self.update_action_button = None
+        self.update_progress_bar = None
+        self.update_percent_label = None
+        self.update_downloaded_label = None
+        self.update_speed_label = None
+        self.update_remaining_label = None
+        self.update_stage_labels = []
         self.manual_update_info = None
 
     def _update_window_is_open(self) -> bool:
@@ -863,6 +967,9 @@ class LauncherGui:
         notes: list[str] | None = None,
         error: str = "",
     ) -> None:
+        self.update_status = status
+        if latest_version:
+            self.update_latest_version = latest_version
         if not self._update_window_is_open() or self.update_status_label is None or self.update_action_button is None:
             return
         self.update_status_label.configure(
@@ -874,14 +981,32 @@ class LauncherGui:
                 error,
             )
         )
-        if status in {"checking", "downloading"}:
-            text = "正在检查…" if status == "checking" else "正在下载并安装…"
-            self.update_action_button.configure(text=text, state="disabled", command=lambda: None)
+        self._update_stage_colors(status)
+        if status == "checking":
+            self.update_action_button.configure(text="正在检查…", state="disabled", command=lambda: None)
         elif status == "available":
             self.update_action_button.configure(
                 text="立即更新",
                 state="normal",
-                command=self.start_manual_update,
+                command=self.start_update_download,
+            )
+        elif status in {"downloading", "verifying"}:
+            self.update_action_button.configure(
+                text="停止更新",
+                state="normal",
+                command=self.stop_update_download,
+            )
+        elif status in {"preparing_install", "updater_started"}:
+            self.update_action_button.configure(
+                text="正在安装…",
+                state="disabled",
+                command=lambda: None,
+            )
+        elif status in {"cancelled", "failed"}:
+            self.update_action_button.configure(
+                text="重新开始",
+                state="normal",
+                command=self.start_update_download,
             )
         else:
             self.update_action_button.configure(
@@ -890,7 +1015,84 @@ class LauncherGui:
                 command=self.start_manual_update_check,
             )
 
+    def _update_stage_colors(self, status: str) -> None:
+        current_by_status = {
+            "checking": 0,
+            "available": 0,
+            "downloading": 0,
+            "verifying": 1,
+            "preparing_install": 2,
+            "updater_started": 3,
+        }
+        current = current_by_status.get(status, 0)
+        for index, label in enumerate(self.update_stage_labels):
+            if index < current:
+                color = "#176342"
+            elif index == current:
+                color = "#F05A28"
+            else:
+                color = "#7B8790"
+            label.configure(text_color=color)
+
+    def _receive_update_progress(self, progress: DownloadProgress) -> None:
+        self.pending_update_progress = progress
+
+    def _poll_update_progress(self) -> None:
+        if not self._update_window_is_open():
+            return
+        if self.pending_update_results:
+            kind, detail = self.pending_update_results.pop(0)
+            if kind == "preparing":
+                self._set_update_window_state("preparing_install", detail)
+            elif kind == "cancelled":
+                self._finish_update_cancelled()
+                if self._update_window_is_open():
+                    self.update_window.after(250, self._poll_update_progress)
+                return
+            elif kind == "failed":
+                self._finish_update_failed(detail)
+                if self._update_window_is_open():
+                    self.update_window.after(250, self._poll_update_progress)
+                return
+            elif kind == "started":
+                self._finish_updater_started(detail)
+                return
+        progress = self.pending_update_progress
+        if progress is not None:
+            now = time.monotonic()
+            phase_changed = progress.phase != self.last_progress_phase
+            if phase_changed or now - self.last_progress_refresh >= 1.0:
+                self._render_update_progress(progress)
+                self.last_progress_phase = progress.phase
+                self.last_progress_refresh = now
+        if self._update_window_is_open():
+            self.update_window.after(250, self._poll_update_progress)
+
+    def _render_update_progress(self, progress: DownloadProgress) -> None:
+        if progress.phase == "downloading" and self.update_status != "downloading":
+            self._set_update_window_state("downloading", self.update_latest_version)
+        elif progress.phase in {"verifying", "verified"} and self.update_status == "downloading":
+            self._set_update_window_state("verifying", self.update_latest_version)
+        text = build_update_progress_text(progress)
+        if self.update_progress_bar is not None:
+            self.update_progress_bar.stop()
+            self.update_progress_bar.configure(mode="indeterminate" if text.indeterminate else "determinate")
+            if text.indeterminate:
+                self.update_progress_bar.start()
+            else:
+                self.update_progress_bar.set(text.value)
+        if self.update_percent_label is not None:
+            self.update_percent_label.configure(text=text.percent)
+        if self.update_downloaded_label is not None:
+            self.update_downloaded_label.configure(text=text.downloaded)
+        if self.update_speed_label is not None:
+            self.update_speed_label.configure(text=text.speed)
+        if self.update_remaining_label is not None:
+            self.update_remaining_label.configure(text=text.remaining)
+
     def start_manual_update_check(self) -> None:
+        if self.update_status in {"downloading", "verifying", "preparing_install", "updater_started"}:
+            return
         if self.manual_update_check_running:
             return
         self.manual_update_check_running = True
@@ -909,6 +1111,8 @@ class LauncherGui:
 
     def _finish_manual_update_check(self, info: object) -> None:
         self.manual_update_check_running = False
+        if self.update_status in {"downloading", "verifying", "preparing_install", "updater_started"}:
+            return
         latest_version = str(getattr(info, "version"))
         if is_newer_version(latest_version, self.version):
             self.manual_update_info = info
@@ -922,9 +1126,14 @@ class LauncherGui:
 
     def _finish_manual_update_check_failure(self, message: str) -> None:
         self.manual_update_check_running = False
+        if self.update_status in {"downloading", "verifying", "preparing_install", "updater_started"}:
+            return
         self._set_update_window_state("failed", error=message)
 
     def start_manual_update(self) -> None:
+        self.start_update_download()
+
+    def start_update_download(self) -> None:
         info = self.manual_update_info
         if info is None:
             self.start_manual_update_check()
@@ -935,29 +1144,87 @@ class LauncherGui:
                 error="整理任务或其他更新正在运行，请等待完成后再试。",
             )
             return
+        self.update_cancel_event = threading.Event()
+        self.pending_update_progress = None
+        self.pending_update_results.clear()
+        self.last_progress_phase = ""
+        self.last_progress_refresh = 0.0
+        self._reset_update_progress_display()
+        self._show_update_overlay()
         self._set_update_window_state("downloading", str(getattr(info, "version")))
+        self._raise_update_window()
         threading.Thread(
             target=self._download_and_start_update,
-            args=(info, True),
+            args=(info,),
             daemon=True,
         ).start()
 
-    def offer_update(self, info: object) -> None:
-        version = getattr(info, "version")
-        notes = getattr(info, "notes")
-        note_text = "\n".join(f"• {note}" for note in notes) or "未提供更新说明"
-        if messagebox.askyesno(
-            "发现新版本",
-            f"当前版本：{self.version}\n最新版本：{version}\n\n{note_text}\n\n是否立即更新？",
-        ):
-            if not self.operation_gate.begin_update():
-                messagebox.showwarning(APP_TITLE, "整理任务或更新正在运行，请等待完成后再试。")
-                return
-            threading.Thread(target=self._download_and_start_update, args=(info,), daemon=True).start()
+    def stop_update_download(self) -> None:
+        if self.update_cancel_event is not None:
+            self.update_cancel_event.set()
+        if self.update_action_button is not None:
+            self.update_action_button.configure(text="正在停止…", state="disabled")
 
-    def _download_and_start_update(self, info: object, manual_window: bool = False) -> None:
+    def offer_update(self, info: object) -> None:
+        if self.update_status in {"downloading", "verifying", "preparing_install", "updater_started"}:
+            return
+        self.open_update_window(start_check=False)
+        self.manual_update_check_running = False
+        self.manual_update_info = info
+        self._set_update_window_state(
+            "available",
+            str(getattr(info, "version")),
+            list(getattr(info, "notes")),
+        )
+        self._raise_update_window()
+
+    def _reset_update_progress_display(self) -> None:
+        if self.update_progress_bar is not None:
+            self.update_progress_bar.stop()
+            self.update_progress_bar.configure(mode="determinate")
+            self.update_progress_bar.set(0)
+        if self.update_percent_label is not None:
+            self.update_percent_label.configure(text="0%")
+        if self.update_downloaded_label is not None:
+            self.update_downloaded_label.configure(text="0 B")
+        if self.update_speed_label is not None:
+            self.update_speed_label.configure(text="0 B/s")
+        if self.update_remaining_label is not None:
+            self.update_remaining_label.configure(text="计算中")
+
+    def _show_update_overlay(self) -> None:
+        if self.update_overlay is not None:
+            return
+        overlay = ctk.CTkFrame(self.root, fg_color="#17212A", corner_radius=0)
+        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        ctk.CTkLabel(
+            overlay,
+            text="软件正在更新\n请在更新窗口中操作",
+            text_color="#FFFFFF",
+            font=ctk.CTkFont(size=22, weight="bold"),
+            justify="center",
+        ).place(relx=0.5, rely=0.5, anchor="center")
+        overlay.lift()
+        self.update_overlay = overlay
+
+    def _release_update_lock(self) -> None:
+        if self.update_overlay is not None:
+            self.update_overlay.destroy()
+            self.update_overlay = None
+        self.update_cancel_event = None
+        self.operation_gate.end_update()
+
+    def _download_and_start_update(self, info: object) -> None:
         try:
-            package = download_update(info)  # type: ignore[arg-type]
+            package = download_update(  # type: ignore[arg-type]
+                info,
+                cancel_event=self.update_cancel_event,
+                progress_callback=self._receive_update_progress,
+            )
+            latest_version = str(getattr(info, "version"))
+            self.pending_update_results.append(("preparing", latest_version))
+            if not os.access(self.base_dir, os.W_OK):
+                raise PermissionError(f"安装目录不可写：{self.base_dir}")
             updater_exe = self.base_dir / "updater.exe"
             updater_script = self.base_dir / "updater.py"
             restart = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
@@ -976,17 +1243,31 @@ class LauncherGui:
                 "--restart", str(restart),
             ])
             subprocess.Popen(command, cwd=self.base_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.root.after(0, self.root.destroy)
+            self.pending_update_results.append(("started", latest_version))
+        except UpdateCancelled:
+            self.pending_update_results.append(("cancelled", ""))
         except Exception as exc:
-            self.operation_gate.end_update()
-            message = str(exc)
-            if manual_window:
-                self.root.after(
-                    0,
-                    lambda: self._set_update_window_state("failed", error=f"更新失败：{message}"),
-                )
-            else:
-                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"更新失败：\n{message}"))
+            self.pending_update_results.append(("failed", str(exc)))
+
+    def _finish_update_cancelled(self) -> None:
+        self.pending_update_progress = None
+        self._release_update_lock()
+        self._set_update_window_state("cancelled", self.update_latest_version)
+        if self.update_status_label is not None:
+            self.update_status_label.configure(text="更新已停止，未修改任何程序文件")
+
+    def _finish_update_failed(self, message: str) -> None:
+        self.pending_update_progress = None
+        self._release_update_lock()
+        self._set_update_window_state(
+            "failed",
+            self.update_latest_version,
+            error=f"更新失败：{message}",
+        )
+
+    def _finish_updater_started(self, latest_version: str) -> None:
+        self._set_update_window_state("updater_started", latest_version)
+        self.root.after(100, self.root.destroy)
 
     def _add_path_card(
         self,
