@@ -32,6 +32,7 @@ from launcher_core import (
     build_command,
     build_preview_rows,
     build_safety_status_text,
+    build_update_status_text,
     clean_path_value,
     default_window_geometry,
     default_settings,
@@ -47,7 +48,7 @@ from launcher_core import (
 )
 
 
-APP_TITLE = "Windows 文件整理助手 v2.4.3"
+APP_TITLE = "Windows 文件整理助手 v2.4.4"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 UPDATE_CHECK_LOG = "update_check.log"
 
@@ -70,7 +71,7 @@ class LauncherGui:
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
-        self.version = read_version(self.base_dir) or "2.4.3"
+        self.version = read_version(self.base_dir) or "2.4.4"
         settings = self.load_settings()
         self._initializing = True
 
@@ -98,6 +99,11 @@ class LauncherGui:
         self.selected_config_category = ""
         self.config_keyword_widgets: list[ctk.CTkFrame] = []
         self.operation_gate = OperationGate()
+        self.update_window: ctk.CTkToplevel | None = None
+        self.update_status_label: ctk.CTkLabel | None = None
+        self.update_action_button: ctk.CTkButton | None = None
+        self.manual_update_info: object | None = None
+        self.manual_update_check_running = False
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -224,6 +230,19 @@ class LauncherGui:
             justify="left",
         )
         self.safety_status.grid(row=6, column=0, sticky="sew", padx=22, pady=(0, 26))
+        self.update_nav_button = ctk.CTkButton(
+            sidebar,
+            text="检查更新\n查看版本与更新状态",
+            command=self.open_update_window,
+            anchor="w",
+            height=58,
+            fg_color="#1B2630",
+            hover_color="#24313C",
+            text_color="#DCE6EE",
+            corner_radius=8,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.update_nav_button.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 18))
 
         center_shell = ctk.CTkFrame(body, fg_color="#EEF2F4", corner_radius=0)
         self.task_center = center_shell
@@ -750,19 +769,178 @@ class LauncherGui:
     def check_for_updates_async(self) -> None:
         threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
 
+    def _log_update_check_failure(self, exc: Exception) -> None:
+        log_path = self.base_dir / UPDATE_CHECK_LOG
+        checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"[{checked_at}] 检查更新失败：{type(exc).__name__}: {exc}\n")
+        except OSError:
+            pass
+
     def _check_for_updates_worker(self) -> None:
         try:
             info = fetch_update_info_with_retry()
             if is_newer_version(info.version, self.version):
                 self.root.after(0, lambda: self.offer_update(info))
         except Exception as exc:
-            log_path = self.base_dir / UPDATE_CHECK_LOG
-            checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                with log_path.open("a", encoding="utf-8") as log_file:
-                    log_file.write(f"[{checked_at}] 检查更新失败：{type(exc).__name__}: {exc}\n")
-            except OSError:
-                pass
+            self._log_update_check_failure(exc)
+
+    def open_update_window(self) -> None:
+        if self.update_window is not None and self.update_window.winfo_exists():
+            self.update_window.lift()
+            self.update_window.focus_force()
+            return
+
+        window = ctk.CTkToplevel(self.root)
+        self.update_window = window
+        window.title("检查更新")
+        window.geometry("520x390")
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.configure(fg_color="#EEF2F4")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=1)
+        window.protocol("WM_DELETE_WINDOW", self.close_update_window)
+
+        ctk.CTkLabel(
+            window,
+            text="软件更新",
+            text_color="#101820",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=28, pady=(26, 12))
+
+        status_card = ctk.CTkFrame(
+            window,
+            fg_color="#FFFFFF",
+            border_color="#D6DEE5",
+            border_width=1,
+            corner_radius=10,
+        )
+        status_card.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 16))
+        status_card.grid_columnconfigure(0, weight=1)
+        status_card.grid_rowconfigure(0, weight=1)
+        self.update_status_label = ctk.CTkLabel(
+            status_card,
+            text="",
+            text_color="#33414C",
+            justify="left",
+            anchor="nw",
+            wraplength=410,
+            font=ctk.CTkFont(size=14),
+        )
+        self.update_status_label.grid(row=0, column=0, sticky="nsew", padx=22, pady=20)
+
+        self.update_action_button = ctk.CTkButton(
+            window,
+            text="正在检查…",
+            state="disabled",
+            command=self.start_manual_update_check,
+            height=42,
+            fg_color="#F05A28",
+            hover_color="#D94C1D",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.update_action_button.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 26))
+        window.after(50, window.lift)
+        self.start_manual_update_check()
+
+    def close_update_window(self) -> None:
+        if self.update_window is not None:
+            self.update_window.destroy()
+        self.update_window = None
+        self.update_status_label = None
+        self.update_action_button = None
+        self.manual_update_info = None
+
+    def _update_window_is_open(self) -> bool:
+        return self.update_window is not None and bool(self.update_window.winfo_exists())
+
+    def _set_update_window_state(
+        self,
+        status: str,
+        latest_version: str = "",
+        notes: list[str] | None = None,
+        error: str = "",
+    ) -> None:
+        if not self._update_window_is_open() or self.update_status_label is None or self.update_action_button is None:
+            return
+        self.update_status_label.configure(
+            text=build_update_status_text(  # type: ignore[arg-type]
+                status,
+                self.version,
+                latest_version,
+                notes,
+                error,
+            )
+        )
+        if status in {"checking", "downloading"}:
+            text = "正在检查…" if status == "checking" else "正在下载并安装…"
+            self.update_action_button.configure(text=text, state="disabled", command=lambda: None)
+        elif status == "available":
+            self.update_action_button.configure(
+                text="立即更新",
+                state="normal",
+                command=self.start_manual_update,
+            )
+        else:
+            self.update_action_button.configure(
+                text="重新检查",
+                state="normal",
+                command=self.start_manual_update_check,
+            )
+
+    def start_manual_update_check(self) -> None:
+        if self.manual_update_check_running:
+            return
+        self.manual_update_check_running = True
+        self.manual_update_info = None
+        self._set_update_window_state("checking")
+        threading.Thread(target=self._manual_update_check_worker, daemon=True).start()
+
+    def _manual_update_check_worker(self) -> None:
+        try:
+            info = fetch_update_info_with_retry()
+            self.root.after(0, lambda: self._finish_manual_update_check(info))
+        except Exception as exc:
+            self._log_update_check_failure(exc)
+            message = f"{type(exc).__name__}: {exc}"
+            self.root.after(0, lambda: self._finish_manual_update_check_failure(message))
+
+    def _finish_manual_update_check(self, info: object) -> None:
+        self.manual_update_check_running = False
+        latest_version = str(getattr(info, "version"))
+        if is_newer_version(latest_version, self.version):
+            self.manual_update_info = info
+            self._set_update_window_state(
+                "available",
+                latest_version,
+                list(getattr(info, "notes")),
+            )
+        else:
+            self._set_update_window_state("latest", latest_version)
+
+    def _finish_manual_update_check_failure(self, message: str) -> None:
+        self.manual_update_check_running = False
+        self._set_update_window_state("failed", error=message)
+
+    def start_manual_update(self) -> None:
+        info = self.manual_update_info
+        if info is None:
+            self.start_manual_update_check()
+            return
+        if not self.operation_gate.begin_update():
+            self._set_update_window_state(
+                "failed",
+                error="整理任务或其他更新正在运行，请等待完成后再试。",
+            )
+            return
+        self._set_update_window_state("downloading", str(getattr(info, "version")))
+        threading.Thread(
+            target=self._download_and_start_update,
+            args=(info, True),
+            daemon=True,
+        ).start()
 
     def offer_update(self, info: object) -> None:
         version = getattr(info, "version")
@@ -777,7 +955,7 @@ class LauncherGui:
                 return
             threading.Thread(target=self._download_and_start_update, args=(info,), daemon=True).start()
 
-    def _download_and_start_update(self, info: object) -> None:
+    def _download_and_start_update(self, info: object, manual_window: bool = False) -> None:
         try:
             package = download_update(info)  # type: ignore[arg-type]
             updater_exe = self.base_dir / "updater.exe"
@@ -802,7 +980,13 @@ class LauncherGui:
         except Exception as exc:
             self.operation_gate.end_update()
             message = str(exc)
-            self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"更新失败：\n{message}"))
+            if manual_window:
+                self.root.after(
+                    0,
+                    lambda: self._set_update_window_state("failed", error=f"更新失败：{message}"),
+                )
+            else:
+                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, f"更新失败：\n{message}"))
 
     def _add_path_card(
         self,

@@ -10,6 +10,7 @@ from typing import Any, Literal, cast
 
 SETTINGS_NAME = "launcher_settings.json"
 Mode = Literal["dry-run", "apply", "undo-last"]
+UpdateStatus = Literal["checking", "latest", "available", "failed", "downloading"]
 VALID_MODES: set[str] = {"dry-run", "apply", "undo-last"}
 PREVIEW_COLUMN_WIDTHS = {
     "序号": 48,
@@ -217,6 +218,35 @@ def build_safety_status_text(mode: str, archive_enabled: bool) -> str:
     if normalized == "undo-last":
         return "当前模式：Undo｜撤销：仅根据日志执行｜不会猜测路径｜不会覆盖已有路径"
     return "当前模式：Dry Run｜不会修改文件｜不会压缩｜不会删除原件"
+
+
+def build_update_status_text(
+    status: UpdateStatus,
+    current_version: str,
+    latest_version: str = "",
+    notes: list[str] | None = None,
+    error: str = "",
+) -> str:
+    if status == "checking":
+        return f"正在检查更新…\n\n当前版本：{current_version}"
+    if status == "latest":
+        version = latest_version or current_version
+        return f"已是最新版本。\n\n当前版本：{current_version}\n线上版本：{version}"
+    if status == "available":
+        note_text = "\n".join(f"• {note}" for note in (notes or [])) or "• 未提供更新说明"
+        return (
+            f"发现新版本。\n\n当前版本：{current_version}\n"
+            f"最新版本：{latest_version}\n\n更新内容：\n{note_text}"
+        )
+    if status == "downloading":
+        return (
+            f"正在下载并校验更新…\n\n当前版本：{current_version}\n"
+            f"目标版本：{latest_version}\n\n完成后软件将自动关闭、安装并重新启动。"
+        )
+    return (
+        f"检查更新失败。\n\n当前版本：{current_version}\n"
+        f"失败原因：{error or '未知错误'}\n\n可以点击“重新检查”再次尝试。"
+    )
 
 
 def wheel_delta_to_units(delta: int) -> int:

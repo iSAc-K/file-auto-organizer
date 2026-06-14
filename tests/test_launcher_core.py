@@ -12,6 +12,7 @@ from launcher_core import (
     build_command,
     build_preview_rows,
     build_safety_status_text,
+    build_update_status_text,
     clean_path_value,
     find_latest_report,
     format_python_command,
@@ -27,6 +28,21 @@ from launcher_core import (
 
 
 class LauncherCoreTests(unittest.TestCase):
+    def test_update_status_text_covers_manual_check_states(self):
+        self.assertIn("正在检查", build_update_status_text("checking", "2.4.3"))
+        self.assertIn("已是最新版本", build_update_status_text("latest", "2.4.3", "2.4.3"))
+        available = build_update_status_text(
+            "available",
+            "2.4.3",
+            "2.4.4",
+            ["新增手动检查更新"],
+        )
+        self.assertIn("发现新版本", available)
+        self.assertIn("2.4.4", available)
+        self.assertIn("新增手动检查更新", available)
+        self.assertIn("检查更新失败", build_update_status_text("failed", "2.4.3", error="网络超时"))
+        self.assertIn("正在下载", build_update_status_text("downloading", "2.4.3", "2.4.4"))
+
     def test_operation_gate_prevents_update_and_organizer_overlap(self):
         gate = OperationGate()
 
