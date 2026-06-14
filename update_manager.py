@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 
 UPDATE_MANIFEST_URL = (
@@ -21,6 +22,63 @@ class UpdateInfo:
     download_url: str
     sha256: str
     notes: list[str]
+
+
+ProgressPhase = Literal["downloading", "verifying", "verified"]
+
+
+@dataclass(frozen=True)
+class DownloadProgress:
+    phase: ProgressPhase
+    downloaded_bytes: int
+    total_bytes: int | None
+    elapsed_seconds: float
+    average_bytes_per_second: float
+    estimated_seconds_remaining: float | None
+
+
+class UpdateCancelled(Exception):
+    def __init__(self, path: Path):
+        super().__init__("用户已停止更新。")
+        self.path = path
+
+
+def _raise_if_cancelled(
+    cancel_event: threading.Event | None,
+    path: Path,
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise UpdateCancelled(path)
+
+
+def _build_progress(
+    phase: ProgressPhase,
+    downloaded: int,
+    total: int | None,
+    elapsed: float,
+) -> DownloadProgress:
+    speed = downloaded / elapsed if elapsed > 0 else 0.0
+    remaining = None
+    if total is not None and speed > 0:
+        remaining = max(0.0, (total - downloaded) / speed)
+    return DownloadProgress(phase, downloaded, total, elapsed, speed, remaining)
+
+
+def _report_progress(
+    callback: Callable[[DownloadProgress], None] | None,
+    progress: DownloadProgress,
+) -> None:
+    if callback is not None:
+        callback(progress)
+
+
+def _content_length(response: Any) -> int | None:
+    value = response.headers.get("Content-Length")
+    try:
+        total = int(value)
+    except (TypeError, ValueError):
+        return None
+    return total if total > 0 else None
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -84,24 +142,106 @@ def fetch_update_info_with_retry(
     raise last_error
 
 
-def verify_sha256(path: Path, expected: str) -> bool:
+def verify_sha256(
+    path: Path,
+    expected: str,
+    cancel_event: threading.Event | None = None,
+    progress_callback: Callable[[DownloadProgress], None] | None = None,
+    total_bytes: int | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
     digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
+    verified_bytes = 0
+    started_at = clock()
+    try:
+        _raise_if_cancelled(cancel_event, path)
+        _report_progress(
+            progress_callback,
+            _build_progress("verifying", 0, total_bytes, 0.0),
+        )
+        _raise_if_cancelled(cancel_event, path)
+        with path.open("rb") as file:
+            while True:
+                _raise_if_cancelled(cancel_event, path)
+                chunk = file.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                verified_bytes += len(chunk)
+                elapsed = max(0.0, clock() - started_at)
+                _report_progress(
+                    progress_callback,
+                    _build_progress(
+                        "verifying",
+                        verified_bytes,
+                        total_bytes,
+                        elapsed,
+                    ),
+                )
+                _raise_if_cancelled(cancel_event, path)
+    except UpdateCancelled:
+        path.unlink(missing_ok=True)
+        raise
     return digest.hexdigest().casefold() == expected.strip().casefold()
 
 
-def download_update(info: UpdateInfo, timeout: float = 60.0) -> Path:
+def download_update(
+    info: UpdateInfo,
+    timeout: float = 60.0,
+    cancel_event: threading.Event | None = None,
+    progress_callback: Callable[[DownloadProgress], None] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    chunk_size: int = 1024 * 1024,
+) -> Path:
+    if chunk_size < 1:
+        raise ValueError("下载块大小必须是正整数。")
     target = Path(tempfile.mkdtemp(prefix="file-organizer-update-")) / "update.zip"
     request = urllib.request.Request(info.download_url, headers={"User-Agent": "WindowsFileOrganizer-Updater"})
-    with urllib.request.urlopen(request, timeout=timeout) as response, target.open("wb") as output:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            output.write(chunk)
-    if not verify_sha256(target, info.sha256):
+    started_at = clock()
+    downloaded = 0
+    total_bytes = None
+    try:
+        _raise_if_cancelled(cancel_event, target)
+        with urllib.request.urlopen(request, timeout=timeout) as response, target.open("wb") as output:
+            total_bytes = _content_length(response)
+            while True:
+                _raise_if_cancelled(cancel_event, target)
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                output.write(chunk)
+                downloaded += len(chunk)
+                elapsed = max(0.0, clock() - started_at)
+                _report_progress(
+                    progress_callback,
+                    _build_progress(
+                        "downloading",
+                        downloaded,
+                        total_bytes,
+                        elapsed,
+                    ),
+                )
+                _raise_if_cancelled(cancel_event, target)
+        if not verify_sha256(
+            target,
+            info.sha256,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            total_bytes=total_bytes,
+            clock=clock,
+        ):
+            raise ValueError("更新包 SHA-256 校验失败。")
+        elapsed = max(0.0, clock() - started_at)
+        _report_progress(
+            progress_callback,
+            _build_progress(
+                "verified",
+                downloaded,
+                total_bytes,
+                elapsed,
+            ),
+        )
+    except Exception:
         target.unlink(missing_ok=True)
-        raise ValueError("更新包 SHA-256 校验失败。")
+        raise
     return target

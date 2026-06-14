@@ -1,11 +1,17 @@
 import hashlib
+import io
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from update_manager import (
+    DownloadProgress,
     UpdateInfo,
+    UpdateCancelled,
+    download_update,
     fetch_update_info_with_retry,
     is_newer_version,
     parse_update_manifest,
@@ -13,7 +19,39 @@ from update_manager import (
 )
 
 
+class FakeResponse:
+    def __init__(self, payload: bytes, content_length: str | None = None):
+        self.stream = io.BytesIO(payload)
+        self.headers = {}
+        if content_length is not None:
+            self.headers["Content-Length"] = content_length
+
+    def read(self, size: int) -> bytes:
+        return self.stream.read(size)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class ControlledClock:
+    def __init__(self, *values: float):
+        self.values = iter(values)
+        self.last = values[-1]
+
+    def __call__(self) -> float:
+        self.last = next(self.values, self.last)
+        return self.last
+
+
 class UpdateManagerTests(unittest.TestCase):
+    def download_directory(self, root: str) -> Path:
+        directory = Path(root) / "download"
+        directory.mkdir()
+        return directory
+
     def test_semantic_version_comparison(self):
         self.assertTrue(is_newer_version("2.4.0", "2.3"))
         self.assertTrue(is_newer_version("2.10", "2.9.9"))
@@ -40,6 +78,237 @@ class UpdateManagerTests(unittest.TestCase):
             expected = hashlib.sha256(b"payload").hexdigest()
             self.assertTrue(verify_sha256(path, expected))
             self.assertFalse(verify_sha256(path, "0" * 64))
+
+    def test_download_reports_total_average_speed_and_remaining_time(self):
+        payload = b"x" * 12
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            hashlib.sha256(payload).hexdigest(),
+            [],
+        )
+        events: list[DownloadProgress] = []
+        clock = ControlledClock(10.0, 11.0, 12.0, 14.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = self.download_directory(tmp)
+            with (
+                patch(
+                    "update_manager.urllib.request.urlopen",
+                    return_value=FakeResponse(payload, str(len(payload))),
+                ),
+                patch("update_manager.tempfile.mkdtemp", return_value=str(download_dir)),
+            ):
+                path = download_update(
+                    info,
+                    progress_callback=events.append,
+                    clock=clock,
+                    chunk_size=4,
+                )
+
+            download_events = [event for event in events if event.phase == "downloading"]
+            self.assertEqual([event.downloaded_bytes for event in download_events], [4, 8, 12])
+            self.assertEqual(
+                [event.average_bytes_per_second for event in download_events],
+                [4.0, 4.0, 3.0],
+            )
+            self.assertEqual(
+                [event.estimated_seconds_remaining for event in download_events],
+                [2.0, 1.0, 0.0],
+            )
+            self.assertEqual(download_events[-1].total_bytes, 12)
+            self.assertEqual(download_events[-1].elapsed_seconds, 4.0)
+            self.assertEqual(download_events[-1].average_bytes_per_second, 3.0)
+            self.assertEqual(download_events[-1].estimated_seconds_remaining, 0.0)
+            self.assertEqual(events[-1].phase, "verified")
+            path.unlink()
+
+        self.assertFalse(Path(tmp).exists())
+
+    def test_download_without_content_length_reports_unknown_total(self):
+        payload = b"payload"
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            hashlib.sha256(payload).hexdigest(),
+            [],
+        )
+        events: list[DownloadProgress] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = self.download_directory(tmp)
+            with (
+                patch(
+                    "update_manager.urllib.request.urlopen",
+                    return_value=FakeResponse(payload),
+                ),
+                patch("update_manager.tempfile.mkdtemp", return_value=str(download_dir)),
+            ):
+                path = download_update(info, progress_callback=events.append)
+
+            self.assertTrue(
+                all(
+                    event.total_bytes is None
+                    for event in events
+                    if event.phase == "downloading"
+                )
+            )
+            path.unlink()
+
+        self.assertFalse(Path(tmp).exists())
+
+    def test_non_positive_or_invalid_content_length_reports_unknown_total(self):
+        payload = b"payload"
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            hashlib.sha256(payload).hexdigest(),
+            [],
+        )
+
+        for content_length in ("0", "-1", "invalid"):
+            with self.subTest(content_length=content_length):
+                events: list[DownloadProgress] = []
+                with tempfile.TemporaryDirectory() as tmp:
+                    download_dir = self.download_directory(tmp)
+                    with (
+                        patch(
+                            "update_manager.urllib.request.urlopen",
+                            return_value=FakeResponse(payload, content_length),
+                        ),
+                        patch(
+                            "update_manager.tempfile.mkdtemp",
+                            return_value=str(download_dir),
+                        ),
+                    ):
+                        path = download_update(info, progress_callback=events.append)
+
+                    download_events = [
+                        event for event in events if event.phase == "downloading"
+                    ]
+                    self.assertIsNone(download_events[-1].total_bytes)
+                    path.unlink()
+
+                self.assertFalse(Path(tmp).exists())
+
+    def test_download_cancel_deletes_partial_archive(self):
+        payload = b"x" * 20
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            hashlib.sha256(payload).hexdigest(),
+            [],
+        )
+        cancel = threading.Event()
+
+        def cancel_after_first_chunk(event: DownloadProgress) -> None:
+            if event.phase == "downloading" and event.downloaded_bytes >= 4:
+                cancel.set()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = self.download_directory(tmp)
+            with (
+                patch(
+                    "update_manager.urllib.request.urlopen",
+                    return_value=FakeResponse(payload, str(len(payload))),
+                ),
+                patch("update_manager.tempfile.mkdtemp", return_value=str(download_dir)),
+            ):
+                with self.assertRaises(UpdateCancelled) as caught:
+                    download_update(
+                        info,
+                        cancel_event=cancel,
+                        progress_callback=cancel_after_first_chunk,
+                        chunk_size=4,
+                    )
+
+            self.assertFalse(caught.exception.path.exists())
+            self.assertEqual(list(download_dir.iterdir()), [])
+
+        self.assertFalse(Path(tmp).exists())
+
+    def test_verification_cancel_deletes_complete_archive(self):
+        payload = b"x" * 20
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            hashlib.sha256(payload).hexdigest(),
+            [],
+        )
+        cancel = threading.Event()
+
+        def cancel_during_verify(event: DownloadProgress) -> None:
+            if event.phase == "verifying":
+                cancel.set()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = self.download_directory(tmp)
+            with (
+                patch(
+                    "update_manager.urllib.request.urlopen",
+                    return_value=FakeResponse(payload, str(len(payload))),
+                ),
+                patch("update_manager.tempfile.mkdtemp", return_value=str(download_dir)),
+            ):
+                with self.assertRaises(UpdateCancelled) as caught:
+                    download_update(
+                        info,
+                        cancel_event=cancel,
+                        progress_callback=cancel_during_verify,
+                        chunk_size=4,
+                    )
+
+            self.assertFalse(caught.exception.path.exists())
+            self.assertEqual(list(download_dir.iterdir()), [])
+
+        self.assertFalse(Path(tmp).exists())
+
+    def test_sha256_failure_deletes_downloaded_archive(self):
+        payload = b"payload"
+        info = UpdateInfo(
+            "2.5.0",
+            "https://example.com/update.zip",
+            "0" * 64,
+            [],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            download_dir = self.download_directory(tmp)
+            with (
+                patch(
+                    "update_manager.urllib.request.urlopen",
+                    return_value=FakeResponse(payload, str(len(payload))),
+                ),
+                patch("update_manager.tempfile.mkdtemp", return_value=str(download_dir)),
+            ):
+                with self.assertRaises(ValueError):
+                    download_update(info)
+
+            self.assertEqual(list(download_dir.iterdir()), [])
+
+        self.assertFalse(Path(tmp).exists())
+
+    def test_verify_sha256_reports_before_and_during_reading(self):
+        payload = b"x" * (1024 * 1024 + 4)
+        events: list[DownloadProgress] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "update.zip"
+            path.write_bytes(payload)
+            result = verify_sha256(
+                path,
+                hashlib.sha256(payload).hexdigest(),
+                progress_callback=events.append,
+                total_bytes=len(payload),
+                clock=ControlledClock(5.0, 6.0, 7.0),
+            )
+
+        self.assertTrue(result)
+        self.assertEqual([event.phase for event in events], ["verifying"] * 3)
+        self.assertEqual(
+            [event.downloaded_bytes for event in events],
+            [0, 1024 * 1024, len(payload)],
+        )
 
     def test_utf8_bom_manifest_can_be_decoded(self):
         payload = b"\xef\xbb\xbf" + json.dumps(
