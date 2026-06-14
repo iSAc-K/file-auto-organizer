@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from queue import Empty
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -32,15 +33,20 @@ class LauncherGuiSmokeTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.info = SimpleNamespace(version="9.9.9", notes=["测试更新"])
+        self.gui.app_closing = False
+        self.gui._ensure_ui_poll()
 
     def tearDown(self) -> None:
         def cleanup() -> None:
-            self.gui.update_status = "latest"
+            self.gui._set_update_status("latest")
             if self.gui.update_overlay is not None:
                 self.gui._release_update_lock()
-            self.gui.pending_update_progress = None
-            self.gui.pending_update_results.clear()
             self.gui.manual_update_info = None
+            while True:
+                try:
+                    self.gui.ui_event_queue.get_nowait()
+                except Empty:
+                    break
             self.root.quit()
 
         self.root.after_idle(cleanup)
@@ -154,29 +160,42 @@ class LauncherGuiSmokeTests(unittest.TestCase):
             self.run_action(self.gui.start_update_download)
             self.run_until(lambda: self.gui.update_overlay is not None)
             self.assertFalse(self.gui.operation_gate.begin_task())
+            self.assertIs(self.root.grab_current(), self.gui.update_window)
             self.run_action(self.gui.stop_update_download)
             self.run_until(lambda: self.gui.update_status == "cancelled")
 
         self.assertTrue(cancelled.is_set())
         self.assertIsNone(self.gui.update_overlay)
+        self.assertIsNone(self.root.grab_current())
         self.assertTrue(self.gui.operation_gate.begin_task())
         self.gui.operation_gate.end_task()
 
-    def test_completed_download_cannot_be_cancelled_before_ui_refresh(self):
+    def test_completed_download_and_stop_interleave_at_uncancellable_boundary(self):
         self.open_window()
-        cancel_event = threading.Event()
-        self.gui.update_cancel_event = cancel_event
-        self.gui._set_update_window_state("downloading", "9.9.9")
+        download_returned = threading.Event()
+        allow_worker_to_continue = threading.Event()
+
+        def fake_download(_info, cancel_event, progress_callback):
+            download_returned.set()
+            if not allow_worker_to_continue.wait(2.0):
+                raise TimeoutError("worker was not released")
+            return Path("update.zip")
 
         with (
-            patch("launcher_gui.download_update", return_value=Path("update.zip")),
+            patch("launcher_gui.download_update", side_effect=fake_download),
             patch("launcher_gui.os.access", return_value=False),
         ):
-            self.gui._download_and_start_update(self.info)
-            self.gui.stop_update_download()
+            self.gui.manual_update_info = self.info
+            self.run_action(self.gui.start_update_download)
+            self.assertTrue(download_returned.wait(2.0))
+            allow_worker_to_continue.set()
+            self.run_until(lambda: self.gui.update_status == "preparing_install")
+            cancel_event = self.gui.update_cancel_event
+            self.run_action(self.gui.stop_update_download)
 
         self.assertEqual(self.gui.update_status, "preparing_install")
         self.assertFalse(cancel_event.is_set())
+        self.assertIs(self.root.grab_current(), self.gui.update_window)
 
     def test_preparing_install_disables_action_button(self):
         self.open_window()
@@ -227,6 +246,156 @@ class LauncherGuiSmokeTests(unittest.TestCase):
             self.run_action(lambda: self.gui._finish_manual_update_check(self.info))
             self.run_action(self.gui.update_action_button.invoke)
             self.assertEqual(start.call_count, 1)
+
+    def test_background_check_workers_never_call_tk(self):
+        auto_token = self.gui._next_update_check_generation()
+        manual_token = self.gui._next_update_check_generation()
+
+        with (
+            patch("launcher_gui.fetch_update_info_with_retry", return_value=self.info),
+            patch.object(self.root, "after", side_effect=AssertionError("Tk API from worker")),
+        ):
+            auto = threading.Thread(
+                target=self.gui._check_for_updates_worker,
+                args=(auto_token,),
+            )
+            manual = threading.Thread(
+                target=self.gui._manual_update_check_worker,
+                args=(manual_token,),
+            )
+            auto.start()
+            manual.start()
+            auto.join(2.0)
+            manual.join(2.0)
+
+        self.assertFalse(auto.is_alive())
+        self.assertFalse(manual.is_alive())
+
+    def test_background_check_failures_never_call_tk(self):
+        auto_token = self.gui._next_update_check_generation()
+        manual_token = self.gui._next_update_check_generation()
+
+        with (
+            patch(
+                "launcher_gui.fetch_update_info_with_retry",
+                side_effect=OSError("network failed"),
+            ),
+            patch.object(self.gui, "_log_update_check_failure"),
+            patch.object(self.root, "after", side_effect=AssertionError("Tk API from worker")),
+        ):
+            auto = threading.Thread(
+                target=self.gui._check_for_updates_worker,
+                args=(auto_token,),
+            )
+            manual = threading.Thread(
+                target=self.gui._manual_update_check_worker,
+                args=(manual_token,),
+            )
+            auto.start()
+            manual.start()
+            auto.join(2.0)
+            manual.join(2.0)
+
+        self.assertFalse(auto.is_alive())
+        self.assertFalse(manual.is_alive())
+
+    def test_download_worker_failure_never_calls_tk(self):
+        self.open_window()
+        self.gui.update_cancel_event = threading.Event()
+
+        with (
+            patch("launcher_gui.download_update", return_value=Path("update.zip")),
+            patch("launcher_gui.os.access", return_value=True),
+            patch("launcher_gui.Path.exists", return_value=True),
+            patch("launcher_gui.shutil.copy2"),
+            patch("launcher_gui.subprocess.Popen", side_effect=OSError("launch failed")),
+            patch.object(self.root, "after", side_effect=AssertionError("Tk API from worker")),
+        ):
+            worker = threading.Thread(
+                target=self.gui._download_and_start_update,
+                args=(self.info,),
+            )
+            worker.start()
+            worker.join(2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.gui.ui_event_queue.empty())
+
+    def test_old_success_and_failure_check_results_are_ignored(self):
+        self.open_window()
+        old_token = self.gui._next_update_check_generation()
+        latest_token = self.gui._next_update_check_generation()
+        latest_info = SimpleNamespace(version="9.9.8", notes=["latest"])
+        old_info = SimpleNamespace(version="9.9.7", notes=["old"])
+
+        self.gui._enqueue_ui_event("check_success", latest_token, latest_info, True)
+        self.gui._enqueue_ui_event("check_success", old_token, old_info, True)
+        self.gui._enqueue_ui_event("check_failure", old_token, "old failure", True)
+        self.run_until(lambda: self.gui.manual_update_info is latest_info)
+
+        self.assertIs(self.gui.manual_update_info, latest_info)
+        self.assertEqual(self.gui.update_status, "available")
+
+    def test_failed_latest_check_clears_stale_download_info(self):
+        self.open_window()
+        token = self.gui._next_update_check_generation()
+        self.gui.manual_update_info = self.info
+
+        self.gui._enqueue_ui_event("check_failure", token, "network failed", True)
+        self.run_until(lambda: self.gui.update_status == "failed")
+
+        self.assertIsNone(self.gui.manual_update_info)
+
+    def test_manual_check_result_after_update_window_close_is_dropped(self):
+        self.open_window()
+        token = self.gui._next_update_check_generation()
+        self.gui._set_update_window_state("checking")
+        self.run_action(self.gui.close_update_window)
+
+        self.gui._enqueue_ui_event("check_success", token, self.info, True)
+        self.run_action(self.gui._poll_ui_events)
+
+        self.assertIsNone(self.gui.manual_update_info)
+        self.assertFalse(self.gui._update_window_is_open())
+
+    def test_check_result_after_download_start_is_ignored(self):
+        self.open_window()
+        token = self.gui._next_update_check_generation()
+        stale_info = SimpleNamespace(version="9.9.7", notes=["stale"])
+        self.gui.manual_update_info = self.info
+
+        with patch("launcher_gui.threading.Thread"):
+            self.run_action(self.gui.start_update_download)
+        self.gui._enqueue_ui_event("check_success", token, stale_info, True)
+        self.run_action(self.gui._poll_ui_events)
+
+        self.assertEqual(self.gui.update_status, "downloading")
+        self.assertIs(self.gui.manual_update_info, self.info)
+        self.gui._release_update_lock()
+
+    def test_ui_events_are_dropped_after_app_closing(self):
+        self.run_action(self.gui._prepare_app_close)
+        self.gui._enqueue_ui_event("check_success", 999, self.info, True)
+
+        self.gui._poll_ui_events()
+
+        self.assertTrue(self.gui.ui_event_queue.empty())
+        self.assertIsNone(self.gui.manual_update_info)
+        self.assertIsNone(self.gui.ui_poll_after_id)
+        self.gui.app_closing = False
+
+    def test_ui_poll_is_scheduled_once_and_not_rescheduled_after_close(self):
+        self.assertIsNotNone(self.gui.ui_poll_after_id)
+        current_id = self.gui.ui_poll_after_id
+
+        self.gui._ensure_ui_poll()
+        self.assertEqual(self.gui.ui_poll_after_id, current_id)
+
+        self.gui.app_closing = True
+        self.gui._poll_ui_events()
+        self.assertIsNone(self.gui.ui_poll_after_id)
+        self.gui.app_closing = False
+        self.gui._ensure_ui_poll()
 
 
 if __name__ == "__main__":

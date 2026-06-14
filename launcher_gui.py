@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -121,8 +122,10 @@ class LauncherGui:
         self.update_status = "latest"
         self.update_latest_version = ""
         self.update_cancel_event: threading.Event | None = None
-        self.pending_update_progress: DownloadProgress | None = None
-        self.pending_update_results: list[tuple[str, str]] = []
+        self.ui_event_queue: queue.Queue[tuple[str, tuple[object, ...]]] = queue.Queue()
+        self.ui_poll_after_id: str | None = None
+        self.app_closing = False
+        self.update_check_generation = 0
         self.last_progress_phase = ""
         self.last_progress_refresh = 0.0
         self.update_overlay: ctk.CTkFrame | None = None
@@ -144,6 +147,7 @@ class LauncherGui:
         self.on_mode_changed()
         self.update_path_status()
         self._initializing = False
+        self._ensure_ui_poll()
         self.root.after(1200, self.check_for_updates_async)
 
     def load_settings(self) -> LauncherSettings:
@@ -791,10 +795,18 @@ class LauncherGui:
             return
         if self.active_page == "config" and not self.confirm_discard_config_changes():
             return
+        self._prepare_app_close()
         self.root.destroy()
 
     def check_for_updates_async(self) -> None:
-        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+        if self.app_closing:
+            return
+        token = self._next_update_check_generation()
+        threading.Thread(
+            target=self._check_for_updates_worker,
+            args=(token,),
+            daemon=True,
+        ).start()
 
     def _log_update_check_failure(self, exc: Exception) -> None:
         log_path = self.base_dir / UPDATE_CHECK_LOG
@@ -805,13 +817,18 @@ class LauncherGui:
         except OSError:
             pass
 
-    def _check_for_updates_worker(self) -> None:
+    def _check_for_updates_worker(self, token: int) -> None:
         try:
             info = fetch_update_info_with_retry()
-            if is_newer_version(info.version, self.version):
-                self.root.after(0, lambda: self.offer_update(info))
+            self._enqueue_ui_event("check_success", token, info, False)
         except Exception as exc:
             self._log_update_check_failure(exc)
+            self._enqueue_ui_event(
+                "check_failure",
+                token,
+                f"{type(exc).__name__}: {exc}",
+                False,
+            )
 
     def open_update_window(self, start_check: bool = True) -> None:
         if self.update_window is not None and self.update_window.winfo_exists():
@@ -913,7 +930,6 @@ class LauncherGui:
         )
         self.update_action_button.grid(row=3, column=0, sticky="ew", padx=28, pady=(0, 26))
         window.after(50, window.lift)
-        window.after(250, self._poll_update_progress)
         if start_check:
             self.start_manual_update_check()
 
@@ -957,6 +973,8 @@ class LauncherGui:
         self.update_remaining_label = None
         self.update_stage_labels = []
         self.manual_update_info = None
+        self.manual_update_check_running = False
+        self._next_update_check_generation()
 
     def _update_window_is_open(self) -> bool:
         return self.update_window is not None and bool(self.update_window.winfo_exists())
@@ -1036,38 +1054,71 @@ class LauncherGui:
             label.configure(text_color=color)
 
     def _receive_update_progress(self, progress: DownloadProgress) -> None:
-        self.pending_update_progress = progress
+        self._enqueue_ui_event("download_progress", progress)
 
-    def _poll_update_progress(self) -> None:
-        if not self._update_window_is_open():
+    def _enqueue_ui_event(self, kind: str, *payload: object) -> None:
+        if not self.app_closing:
+            self.ui_event_queue.put((kind, payload))
+
+    def _ensure_ui_poll(self) -> None:
+        if self.app_closing or self.ui_poll_after_id is not None:
             return
-        if self.pending_update_results:
-            kind, detail = self.pending_update_results.pop(0)
-            if kind == "render_preparing":
-                self._set_update_window_state("preparing_install", detail)
-            elif kind == "cancelled":
-                self._finish_update_cancelled()
-                if self._update_window_is_open():
-                    self.update_window.after(250, self._poll_update_progress)
+        self.ui_poll_after_id = self.root.after(50, self._poll_ui_events)
+
+    def _poll_ui_events(self) -> None:
+        scheduled_id = self.ui_poll_after_id
+        self.ui_poll_after_id = None
+        if scheduled_id is not None:
+            try:
+                self.root.after_cancel(scheduled_id)
+            except tk.TclError:
+                pass
+        if self.app_closing:
+            self._discard_ui_events()
+            return
+        while True:
+            try:
+                kind, payload = self.ui_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_ui_event(kind, payload)
+            if self.app_closing:
+                self._discard_ui_events()
                 return
-            elif kind == "failed":
-                self._finish_update_failed(detail)
-                if self._update_window_is_open():
-                    self.update_window.after(250, self._poll_update_progress)
+        self._ensure_ui_poll()
+
+    def _discard_ui_events(self) -> None:
+        while True:
+            try:
+                self.ui_event_queue.get_nowait()
+            except queue.Empty:
                 return
-            elif kind == "started":
-                self._finish_updater_started(detail)
-                return
-        progress = self.pending_update_progress
-        if progress is not None:
-            now = time.monotonic()
-            phase_changed = progress.phase != self.last_progress_phase
-            if phase_changed or now - self.last_progress_refresh >= 1.0:
-                self._render_update_progress(progress)
-                self.last_progress_phase = progress.phase
-                self.last_progress_refresh = now
-        if self._update_window_is_open():
-            self.update_window.after(250, self._poll_update_progress)
+
+    def _handle_ui_event(self, kind: str, payload: tuple[object, ...]) -> None:
+        if kind == "check_success":
+            token, info, manual = payload
+            self._handle_check_success(int(token), info, bool(manual))
+        elif kind == "check_failure":
+            token, message, manual = payload
+            self._handle_check_failure(int(token), str(message), bool(manual))
+        elif kind == "download_progress":
+            self._handle_download_progress(payload[0])  # type: ignore[arg-type]
+        elif kind == "render_preparing":
+            self._set_update_window_state("preparing_install", str(payload[0]))
+        elif kind == "download_cancelled":
+            self._finish_update_cancelled()
+        elif kind == "download_failed":
+            self._finish_update_failed(str(payload[0]))
+        elif kind == "updater_started":
+            self._finish_updater_started(str(payload[0]))
+
+    def _handle_download_progress(self, progress: DownloadProgress) -> None:
+        now = time.monotonic()
+        phase_changed = progress.phase != self.last_progress_phase
+        if phase_changed or now - self.last_progress_refresh >= 1.0:
+            self._render_update_progress(progress)
+            self.last_progress_phase = progress.phase
+            self.last_progress_refresh = now
 
     def _render_update_progress(self, progress: DownloadProgress) -> None:
         if progress.phase == "downloading" and self.update_status != "downloading":
@@ -1092,6 +1143,8 @@ class LauncherGui:
             self.update_remaining_label.configure(text=text.remaining)
 
     def start_manual_update_check(self) -> None:
+        if self.app_closing:
+            return
         if self.update_status in {"downloading", "verifying", "preparing_install", "updater_started"}:
             return
         if self.manual_update_check_running:
@@ -1099,16 +1152,53 @@ class LauncherGui:
         self.manual_update_check_running = True
         self.manual_update_info = None
         self._set_update_window_state("checking")
-        threading.Thread(target=self._manual_update_check_worker, daemon=True).start()
+        token = self._next_update_check_generation()
+        threading.Thread(
+            target=self._manual_update_check_worker,
+            args=(token,),
+            daemon=True,
+        ).start()
 
-    def _manual_update_check_worker(self) -> None:
+    def _manual_update_check_worker(self, token: int) -> None:
         try:
             info = fetch_update_info_with_retry()
-            self.root.after(0, lambda: self._finish_manual_update_check(info))
+            self._enqueue_ui_event("check_success", token, info, True)
         except Exception as exc:
             self._log_update_check_failure(exc)
             message = f"{type(exc).__name__}: {exc}"
-            self.root.after(0, lambda: self._finish_manual_update_check_failure(message))
+            self._enqueue_ui_event("check_failure", token, message, True)
+
+    def _next_update_check_generation(self) -> int:
+        with self.update_state_lock:
+            self.update_check_generation += 1
+            return self.update_check_generation
+
+    def _check_result_is_current(self, token: int) -> bool:
+        with self.update_state_lock:
+            return (
+                token == self.update_check_generation
+                and self.update_status
+                not in {"downloading", "verifying", "preparing_install", "updater_started"}
+            )
+
+    def _handle_check_success(self, token: int, info: object, manual: bool) -> None:
+        if not self._check_result_is_current(token):
+            return
+        if manual and not self._update_window_is_open():
+            return
+        if manual:
+            self._finish_manual_update_check(info)
+        elif is_newer_version(str(getattr(info, "version")), self.version):
+            self.offer_update(info)
+
+    def _handle_check_failure(self, token: int, message: str, manual: bool) -> None:
+        if not self._check_result_is_current(token):
+            return
+        if manual and not self._update_window_is_open():
+            return
+        self.manual_update_info = None
+        if manual:
+            self._finish_manual_update_check_failure(message)
 
     def _finish_manual_update_check(self, info: object) -> None:
         self.manual_update_check_running = False
@@ -1145,14 +1235,16 @@ class LauncherGui:
                 error="整理任务或其他更新正在运行，请等待完成后再试。",
             )
             return
+        self._next_update_check_generation()
+        self.manual_update_check_running = False
         self.update_cancel_event = threading.Event()
-        self.pending_update_progress = None
-        self.pending_update_results.clear()
+        self._discard_ui_events()
         self.last_progress_phase = ""
         self.last_progress_refresh = 0.0
         self._reset_update_progress_display()
         self._show_update_overlay()
         self._set_update_window_state("downloading", str(getattr(info, "version")))
+        self._acquire_update_modal()
         self._raise_update_window()
         threading.Thread(
             target=self._download_and_start_update,
@@ -1212,11 +1304,26 @@ class LauncherGui:
         self.update_overlay = overlay
 
     def _release_update_lock(self) -> None:
+        self._release_update_modal()
         if self.update_overlay is not None:
             self.update_overlay.destroy()
             self.update_overlay = None
         self.update_cancel_event = None
         self.operation_gate.end_update()
+
+    def _acquire_update_modal(self) -> None:
+        if self._update_window_is_open():
+            self.update_window.grab_set()
+            self.update_window.lift()
+            self.update_window.focus_force()
+
+    def _release_update_modal(self) -> None:
+        if self._update_window_is_open():
+            try:
+                if self.root.grab_current() is self.update_window:
+                    self.update_window.grab_release()
+            except tk.TclError:
+                pass
 
     def _set_update_status(self, status: str) -> None:
         with self.update_state_lock:
@@ -1231,7 +1338,7 @@ class LauncherGui:
             )
             latest_version = str(getattr(info, "version"))
             self._set_update_status("preparing_install")
-            self.pending_update_results.append(("render_preparing", latest_version))
+            self._enqueue_ui_event("render_preparing", latest_version)
             if not os.access(self.base_dir, os.W_OK):
                 raise PermissionError(f"安装目录不可写：{self.base_dir}")
             updater_exe = self.base_dir / "updater.exe"
@@ -1252,21 +1359,19 @@ class LauncherGui:
                 "--restart", str(restart),
             ])
             subprocess.Popen(command, cwd=self.base_dir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.pending_update_results.append(("started", latest_version))
+            self._enqueue_ui_event("updater_started", latest_version)
         except UpdateCancelled:
-            self.pending_update_results.append(("cancelled", ""))
+            self._enqueue_ui_event("download_cancelled")
         except Exception as exc:
-            self.pending_update_results.append(("failed", str(exc)))
+            self._enqueue_ui_event("download_failed", str(exc))
 
     def _finish_update_cancelled(self) -> None:
-        self.pending_update_progress = None
         self._release_update_lock()
         self._set_update_window_state("cancelled", self.update_latest_version)
         if self.update_status_label is not None:
             self.update_status_label.configure(text="更新已停止，未修改任何程序文件")
 
     def _finish_update_failed(self, message: str) -> None:
-        self.pending_update_progress = None
         self._release_update_lock()
         self._set_update_window_state(
             "failed",
@@ -1276,7 +1381,19 @@ class LauncherGui:
 
     def _finish_updater_started(self, latest_version: str) -> None:
         self._set_update_window_state("updater_started", latest_version)
+        self._prepare_app_close()
         self.root.after(100, self.root.destroy)
+
+    def _prepare_app_close(self) -> None:
+        self.app_closing = True
+        self._next_update_check_generation()
+        if self.ui_poll_after_id is not None:
+            try:
+                self.root.after_cancel(self.ui_poll_after_id)
+            except tk.TclError:
+                pass
+            self.ui_poll_after_id = None
+        self._discard_ui_events()
 
     def _add_path_card(
         self,
