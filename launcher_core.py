@@ -286,8 +286,9 @@ def format_byte_count(byte_count: int | float) -> str:
         return f"{int(value)} B"
     for unit in ("KB", "MB", "GB", "TB"):
         value /= 1024
-        if value < 1024 or unit == "TB":
-            return f"{value:.1f} {unit}"
+        displayed_value = float(f"{value:.1f}")
+        if displayed_value < 1024 or unit == "TB":
+            return f"{displayed_value:.1f} {unit}"
     raise AssertionError("unreachable")
 
 

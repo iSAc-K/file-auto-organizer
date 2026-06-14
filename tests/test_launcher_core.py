@@ -39,6 +39,12 @@ class LauncherCoreTests(unittest.TestCase):
         self.assertEqual(format_byte_count(5 * 1024 * 1024), "5.0 MB")
         self.assertEqual(format_download_speed(1536), "1.5 KB/s")
 
+    def test_update_progress_promotes_kilobytes_that_round_to_one_megabyte(self):
+        self.assertEqual(format_byte_count(1024 * 1024 - 1), "1.0 MB")
+
+    def test_update_progress_promotes_megabytes_that_round_to_one_gigabyte(self):
+        self.assertEqual(format_byte_count(1024 * 1024 * 1024 - 1), "1.0 GB")
+
     def test_update_progress_formats_remaining_time(self):
         self.assertEqual(format_remaining_time(None), "计算中")
         self.assertEqual(format_remaining_time(4.2), "约 5 秒")
