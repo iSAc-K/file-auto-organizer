@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,51 +13,92 @@ from update_manager import DownloadProgress, UpdateCancelled
 
 
 class LauncherGuiSmokeTests(unittest.TestCase):
+    TIMEOUT_MS = 2500
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.root = ctk.CTk()
         cls.root.withdraw()
         with patch.object(LauncherGui, "check_for_updates_async"):
             cls.gui = LauncherGui(cls.root)
+        cls.root.after(0, lambda: cls.root.after(10, cls.root.quit))
+        cls.root.mainloop()
 
     @classmethod
     def tearDownClass(cls) -> None:
         if cls.root.winfo_exists():
-            cls.root.destroy()
+            cls.root.after(300, cls.root.destroy)
+            cls.root.mainloop()
 
     def setUp(self) -> None:
         self.info = SimpleNamespace(version="9.9.9", notes=["测试更新"])
 
     def tearDown(self) -> None:
-        self.gui.update_status = "latest"
-        if self.gui._update_window_is_open():
-            self.gui.close_update_window()
-        if self.gui.update_overlay is not None:
-            self.gui._release_update_lock()
-        self.gui.pending_update_progress = None
-        self.gui.pending_update_results.clear()
-        self.root.update()
+        def cleanup() -> None:
+            self.gui.update_status = "latest"
+            if self.gui.update_overlay is not None:
+                self.gui._release_update_lock()
+            self.gui.pending_update_progress = None
+            self.gui.pending_update_results.clear()
+            self.gui.manual_update_info = None
+            self.root.quit()
 
-    def spin_until(self, predicate, timeout: float = 2.0) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            self.root.update()
+        self.root.after_idle(cleanup)
+        self._run_mainloop_with_timeout()
+
+    def _run_mainloop_with_timeout(self) -> None:
+        timed_out = False
+
+        def fail_timeout() -> None:
+            nonlocal timed_out
+            timed_out = True
+            self.root.quit()
+
+        timeout_id = self.root.after(self.TIMEOUT_MS, fail_timeout)
+        self.root.mainloop()
+        try:
+            self.root.after_cancel(timeout_id)
+        except Exception:
+            pass
+        if timed_out:
+            self.fail("Tk mainloop smoke test timed out")
+
+    def run_until(self, predicate) -> None:
+        def poll() -> None:
             if predicate():
-                return
-            time.sleep(0.01)
-        self.fail("Tk mainloop smoke test timed out")
+                self.root.quit()
+            else:
+                self.root.after(10, poll)
+
+        self.root.after_idle(poll)
+        self._run_mainloop_with_timeout()
+
+    def run_action(self, action) -> None:
+        error: BaseException | None = None
+
+        def invoke() -> None:
+            nonlocal error
+            try:
+                action()
+            except BaseException as exc:
+                error = exc
+            finally:
+                self.root.after(1, self.root.quit)
+
+        self.root.after(0, invoke)
+        self._run_mainloop_with_timeout()
+        if error is not None:
+            raise error
 
     def open_window(self) -> None:
         with patch.object(self.gui, "start_manual_update_check"):
-            self.gui.open_update_window()
-        self.root.update()
+            self.run_action(self.gui.open_update_window)
 
     def test_update_window_is_single_instance(self):
         self.open_window()
         first = self.gui.update_window
 
-        self.gui.open_update_window()
-        self.root.update()
+        self.run_action(self.gui.open_update_window)
 
         self.assertIs(self.gui.update_window, first)
 
@@ -69,8 +109,7 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         self.gui.update_percent_label.configure(text="25%")
 
         with patch("launcher_gui.threading.Thread"):
-            self.gui.start_update_download()
-        self.root.update()
+            self.run_action(self.gui.start_update_download)
 
         self.assertEqual(self.gui.update_downloaded_label.cget("text"), "0 B")
         self.assertEqual(self.gui.update_percent_label.cget("text"), "0%")
@@ -82,8 +121,7 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         self.gui.manual_update_info = active_info
         self.gui._set_update_window_state("downloading", "8.8.8")
 
-        self.gui.offer_update(self.info)
-        self.root.update()
+        self.run_action(lambda: self.gui.offer_update(self.info))
 
         self.assertIs(self.gui.manual_update_info, active_info)
         self.assertEqual(self.gui.update_latest_version, "8.8.8")
@@ -93,7 +131,7 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         self.gui._set_update_window_state("downloading", "9.9.9")
 
         with patch.object(self.gui, "_raise_update_window") as raised:
-            self.gui.on_close()
+            self.run_action(self.gui.on_close)
 
         raised.assert_called_once_with()
         self.assertTrue(bool(self.root.winfo_exists()))
@@ -113,33 +151,61 @@ class LauncherGuiSmokeTests(unittest.TestCase):
 
         with patch("launcher_gui.download_update", side_effect=fake_download):
             self.gui.manual_update_info = self.info
-            self.gui.start_update_download()
-            self.spin_until(lambda: self.gui.update_overlay is not None)
+            self.run_action(self.gui.start_update_download)
+            self.run_until(lambda: self.gui.update_overlay is not None)
             self.assertFalse(self.gui.operation_gate.begin_task())
-            self.gui.stop_update_download()
-            self.spin_until(lambda: self.gui.update_status == "cancelled")
+            self.run_action(self.gui.stop_update_download)
+            self.run_until(lambda: self.gui.update_status == "cancelled")
 
         self.assertTrue(cancelled.is_set())
         self.assertIsNone(self.gui.update_overlay)
         self.assertTrue(self.gui.operation_gate.begin_task())
         self.gui.operation_gate.end_task()
 
+    def test_completed_download_cannot_be_cancelled_before_ui_refresh(self):
+        self.open_window()
+        cancel_event = threading.Event()
+        self.gui.update_cancel_event = cancel_event
+        self.gui._set_update_window_state("downloading", "9.9.9")
+
+        with (
+            patch("launcher_gui.download_update", return_value=Path("update.zip")),
+            patch("launcher_gui.os.access", return_value=False),
+        ):
+            self.gui._download_and_start_update(self.info)
+            self.gui.stop_update_download()
+
+        self.assertEqual(self.gui.update_status, "preparing_install")
+        self.assertFalse(cancel_event.is_set())
+
     def test_preparing_install_disables_action_button(self):
         self.open_window()
 
-        self.gui._set_update_window_state("preparing_install", "9.9.9")
-        self.root.update()
+        self.run_action(
+            lambda: self.gui._set_update_window_state("preparing_install", "9.9.9")
+        )
 
         self.assertEqual(self.gui.update_action_button.cget("text"), "正在安装…")
         self.assertEqual(self.gui.update_action_button.cget("state"), "disabled")
+
+    def test_failed_update_button_says_restart_update(self):
+        self.open_window()
+
+        self.run_action(lambda: self.gui._set_update_window_state("failed"))
+
+        self.assertEqual(self.gui.update_action_button.cget("text"), "重新开始更新")
+
+    def test_overlay_uses_exact_dark_color(self):
+        self.run_action(self.gui._show_update_overlay)
+
+        self.assertEqual(self.gui.update_overlay.cget("fg_color"), "#101820")
 
     def test_close_protocol_keeps_window_open_while_downloading(self):
         self.open_window()
         window = self.gui.update_window
         self.gui._set_update_window_state("downloading", "9.9.9")
 
-        self.gui.close_update_window()
-        self.root.update()
+        self.run_action(self.gui.close_update_window)
 
         self.assertIs(self.gui.update_window, window)
         self.assertTrue(bool(window.winfo_exists()))
@@ -151,17 +217,15 @@ class LauncherGuiSmokeTests(unittest.TestCase):
             patch("launcher_gui.messagebox.askyesno", return_value=False) as ask,
             patch.object(self.gui, "start_update_download") as start,
         ):
-            self.gui.offer_update(self.info)
-            self.root.update()
+            self.run_action(lambda: self.gui.offer_update(self.info))
             self.assertEqual(self.gui.update_status, "available")
-            self.gui.update_action_button.invoke()
+            self.run_action(self.gui.update_action_button.invoke)
             self.assertEqual(start.call_count, 1)
         ask.assert_not_called()
 
         with patch.object(self.gui, "start_update_download") as start:
-            self.gui._finish_manual_update_check(self.info)
-            self.root.update()
-            self.gui.update_action_button.invoke()
+            self.run_action(lambda: self.gui._finish_manual_update_check(self.info))
+            self.run_action(self.gui.update_action_button.invoke)
             self.assertEqual(start.call_count, 1)
 
 

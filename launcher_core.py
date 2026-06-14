@@ -320,16 +320,16 @@ def format_remaining_time(seconds: int | float | None) -> str:
 def build_update_progress_text(progress: DownloadProgress) -> UpdateProgressText:
     downloaded = format_byte_count(progress.downloaded_bytes)
     speed = format_download_speed(progress.average_bytes_per_second)
-    remaining = format_remaining_time(progress.estimated_seconds_remaining)
-    if progress.total_bytes is None:
+    if progress.total_bytes is None or progress.total_bytes <= 0:
         return UpdateProgressText(
             downloaded=downloaded,
             speed=speed,
-            remaining=remaining,
+            remaining="计算中",
             percent="下载中",
             value=0,
             indeterminate=True,
         )
+    remaining = format_remaining_time(progress.estimated_seconds_remaining)
     value = min(1.0, max(0.0, progress.downloaded_bytes / progress.total_bytes))
     return UpdateProgressText(
         downloaded=f"{downloaded} / {format_byte_count(progress.total_bytes)}",

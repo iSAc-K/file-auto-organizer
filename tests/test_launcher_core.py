@@ -73,6 +73,26 @@ class LauncherCoreTests(unittest.TestCase):
         self.assertEqual(text.value, 0)
         self.assertTrue(text.indeterminate)
 
+    def test_build_update_progress_text_treats_non_positive_total_as_unknown(self):
+        for total_bytes in (0, -1):
+            with self.subTest(total_bytes=total_bytes):
+                progress = DownloadProgress(
+                    phase="downloading",
+                    downloaded_bytes=5 * 1024 * 1024,
+                    total_bytes=total_bytes,
+                    elapsed_seconds=2.5,
+                    average_bytes_per_second=2 * 1024 * 1024,
+                    estimated_seconds_remaining=7.6,
+                )
+
+                text = build_update_progress_text(progress)
+
+                self.assertEqual(text.downloaded, "5.0 MB")
+                self.assertEqual(text.remaining, "计算中")
+                self.assertEqual(text.percent, "下载中")
+                self.assertEqual(text.value, 0)
+                self.assertTrue(text.indeterminate)
+
     def test_update_progress_formats_byte_counts_and_speed(self):
         self.assertEqual(format_byte_count(0), "0 B")
         self.assertEqual(format_byte_count(1536), "1.5 KB")

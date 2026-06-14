@@ -117,6 +117,7 @@ class LauncherGui:
         self.update_speed_label: ctk.CTkLabel | None = None
         self.update_remaining_label: ctk.CTkLabel | None = None
         self.update_stage_labels: list[ctk.CTkLabel] = []
+        self.update_state_lock = threading.Lock()
         self.update_status = "latest"
         self.update_latest_version = ""
         self.update_cancel_event: threading.Event | None = None
@@ -967,7 +968,7 @@ class LauncherGui:
         notes: list[str] | None = None,
         error: str = "",
     ) -> None:
-        self.update_status = status
+        self._set_update_status(status)
         if latest_version:
             self.update_latest_version = latest_version
         if not self._update_window_is_open() or self.update_status_label is None or self.update_action_button is None:
@@ -1004,7 +1005,7 @@ class LauncherGui:
             )
         elif status in {"cancelled", "failed"}:
             self.update_action_button.configure(
-                text="重新开始",
+                text="重新开始更新",
                 state="normal",
                 command=self.start_update_download,
             )
@@ -1042,7 +1043,7 @@ class LauncherGui:
             return
         if self.pending_update_results:
             kind, detail = self.pending_update_results.pop(0)
-            if kind == "preparing":
+            if kind == "render_preparing":
                 self._set_update_window_state("preparing_install", detail)
             elif kind == "cancelled":
                 self._finish_update_cancelled()
@@ -1160,9 +1161,12 @@ class LauncherGui:
         ).start()
 
     def stop_update_download(self) -> None:
-        if self.update_cancel_event is not None:
-            self.update_cancel_event.set()
-        if self.update_action_button is not None:
+        with self.update_state_lock:
+            cancellable = self.update_status in {"downloading", "verifying"}
+            cancel_event = self.update_cancel_event
+        if cancellable and cancel_event is not None:
+            cancel_event.set()
+        if cancellable and self.update_action_button is not None:
             self.update_action_button.configure(text="正在停止…", state="disabled")
 
     def offer_update(self, info: object) -> None:
@@ -1195,7 +1199,7 @@ class LauncherGui:
     def _show_update_overlay(self) -> None:
         if self.update_overlay is not None:
             return
-        overlay = ctk.CTkFrame(self.root, fg_color="#17212A", corner_radius=0)
+        overlay = ctk.CTkFrame(self.root, fg_color="#101820", corner_radius=0)
         overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
         ctk.CTkLabel(
             overlay,
@@ -1214,6 +1218,10 @@ class LauncherGui:
         self.update_cancel_event = None
         self.operation_gate.end_update()
 
+    def _set_update_status(self, status: str) -> None:
+        with self.update_state_lock:
+            self.update_status = status
+
     def _download_and_start_update(self, info: object) -> None:
         try:
             package = download_update(  # type: ignore[arg-type]
@@ -1222,7 +1230,8 @@ class LauncherGui:
                 progress_callback=self._receive_update_progress,
             )
             latest_version = str(getattr(info, "version"))
-            self.pending_update_results.append(("preparing", latest_version))
+            self._set_update_status("preparing_install")
+            self.pending_update_results.append(("render_preparing", latest_version))
             if not os.access(self.base_dir, os.W_OK):
                 raise PermissionError(f"安装目录不可写：{self.base_dir}")
             updater_exe = self.base_dir / "updater.exe"
