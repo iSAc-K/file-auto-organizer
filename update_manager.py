@@ -150,10 +150,10 @@ def verify_sha256(
     total_bytes: int | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> bool:
-    digest = hashlib.sha256()
-    verified_bytes = 0
-    started_at = clock()
     try:
+        digest = hashlib.sha256()
+        verified_bytes = 0
+        started_at = clock()
         _raise_if_cancelled(cancel_event, path)
         _report_progress(
             progress_callback,
@@ -179,10 +179,10 @@ def verify_sha256(
                     ),
                 )
                 _raise_if_cancelled(cancel_event, path)
-    except UpdateCancelled:
+        return digest.hexdigest().casefold() == expected.strip().casefold()
+    except Exception:
         path.unlink(missing_ok=True)
         raise
-    return digest.hexdigest().casefold() == expected.strip().casefold()
 
 
 def download_update(

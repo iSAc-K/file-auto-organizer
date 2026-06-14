@@ -310,6 +310,40 @@ class UpdateManagerTests(unittest.TestCase):
             [0, 1024 * 1024, len(payload)],
         )
 
+    def test_verify_sha256_callback_error_deletes_archive_and_propagates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "update.zip"
+            path.write_bytes(b"payload")
+
+            def fail_progress(_event: DownloadProgress) -> None:
+                raise RuntimeError("progress failed")
+
+            with self.assertRaisesRegex(RuntimeError, "progress failed"):
+                verify_sha256(
+                    path,
+                    hashlib.sha256(b"payload").hexdigest(),
+                    progress_callback=fail_progress,
+                )
+
+            self.assertFalse(path.exists())
+
+    def test_verify_sha256_initial_clock_error_deletes_archive_and_propagates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "update.zip"
+            path.write_bytes(b"payload")
+
+            def fail_clock() -> float:
+                raise RuntimeError("clock failed")
+
+            with self.assertRaisesRegex(RuntimeError, "clock failed"):
+                verify_sha256(
+                    path,
+                    hashlib.sha256(b"payload").hexdigest(),
+                    clock=fail_clock,
+                )
+
+            self.assertFalse(path.exists())
+
     def test_utf8_bom_manifest_can_be_decoded(self):
         payload = b"\xef\xbb\xbf" + json.dumps(
             {
