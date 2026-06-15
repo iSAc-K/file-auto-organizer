@@ -65,7 +65,8 @@ from launcher_core import (
 )
 
 
-APP_TITLE = "Windows 文件整理助手 v2.4.5"
+VERSION_FALLBACK = "2.5.0"
+APP_TITLE = f"Windows 文件整理助手 v{VERSION_FALLBACK}"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 UPDATE_CHECK_LOG = "update_check.log"
 
@@ -74,6 +75,10 @@ MODE_LABELS = {
     "apply": "执行整理",
     "undo-last": "撤销上次",
 }
+
+
+def display_version(base_dir: Path) -> str:
+    return read_version(base_dir) or VERSION_FALLBACK
 
 
 class LauncherGui:
@@ -88,7 +93,7 @@ class LauncherGui:
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
-        self.version = read_version(self.base_dir) or "2.4.5"
+        self.version = display_version(self.base_dir)
         settings = self.load_settings()
         self._initializing = True
 

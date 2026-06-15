@@ -2034,6 +2034,8 @@ def find_last_undoable_run(data: Dict[str, Any], root: Path) -> Optional[Dict[st
     for run in reversed(data.get("runs", [])):
         if not isinstance(run, dict):
             continue
+        if run.get("mode", "apply") != "apply":
+            continue
         if run.get("root") != root_text:
             continue
         if run.get("undone") is True:

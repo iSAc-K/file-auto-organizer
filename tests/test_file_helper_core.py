@@ -806,6 +806,64 @@ class FileHelperCoreTests(unittest.TestCase):
         self.assertEqual(saved_data["runs"][0]["status"], "partial")
         self.assertIsNotNone(find_last_undoable_run(saved_data, root))
 
+    def test_find_last_undoable_run_skips_newer_non_apply_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root_text = str(root.resolve())
+            old_apply = {
+                "run_id": "old-apply",
+                "mode": "apply",
+                "root": root_text,
+                "status": "success",
+                "operations": [{"action": "move"}],
+            }
+            newer_dry_run = {
+                "run_id": "newer-dry-run",
+                "mode": "dry-run",
+                "root": root_text,
+                "status": "success",
+                "operations": [{"action": "move"}],
+            }
+
+            selected = find_last_undoable_run(
+                {"runs": [old_apply, newer_dry_run]},
+                root,
+            )
+
+        self.assertIs(selected, old_apply)
+
+    def test_find_last_undoable_run_returns_none_for_only_non_apply_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root_text = str(root.resolve())
+            runs = [
+                {
+                    "mode": mode,
+                    "root": root_text,
+                    "status": "partial",
+                    "operations": [{"action": "move"}],
+                }
+                for mode in ("dry-run", "undo-last")
+            ]
+
+            selected = find_last_undoable_run({"runs": runs}, root)
+
+        self.assertIsNone(selected)
+
+    def test_find_last_undoable_run_accepts_legacy_run_without_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_apply = {
+                "run_id": "legacy-apply",
+                "root": str(root.resolve()),
+                "status": "success",
+                "operations": [{"action": "move"}],
+            }
+
+            selected = find_last_undoable_run({"runs": [legacy_apply]}, root)
+
+        self.assertIs(selected, legacy_apply)
+
     def test_main_log_write_failure_stops_later_groups_and_returns_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

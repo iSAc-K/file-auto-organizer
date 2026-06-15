@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import customtkinter as ctk
 
+import launcher_gui
 from launcher_core import (
     ApplyHistoryState,
     EMPTY_HISTORY_TEXT,
@@ -50,6 +51,11 @@ class LauncherGuiSmokeTests(unittest.TestCase):
     @staticmethod
     def _read_settings_snapshot(path: Path) -> tuple[bool, bytes]:
         return path.exists(), path.read_bytes() if path.exists() else b""
+
+    def test_missing_version_file_uses_250_fallback_in_gui(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(launcher_gui.display_version(Path(tmp)), "2.5.0")
+            self.assertIn("v2.5.0", launcher_gui.APP_TITLE)
 
     def setUp(self) -> None:
         self.saved_gui_state = {

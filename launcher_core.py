@@ -53,6 +53,8 @@ RESULT_STATUS_TEXT = {
     "failed": "失败",
     "pending": "执行中断",
 }
+VALID_RUN_STATUSES = frozenset(RUN_STATUS_TEXT)
+VALID_RESULT_STATUSES = frozenset(RESULT_STATUS_TEXT)
 EMPTY_HISTORY_TEXT = "暂无执行历史，完成一次执行整理后会显示在这里"
 LEGACY_HISTORY_TEXT = "旧版记录，详情不完整"
 
@@ -534,6 +536,8 @@ def parse_history_result(value: object) -> HistoryResult:
             raise ValueError("matched_keywords 每项必须是字符串。")
         parsed_keywords.append(keyword)
     status = _history_text(result, "status")
+    if status not in VALID_RESULT_STATUSES:
+        raise ValueError(f"result.status 不受支持：{status}")
     return HistoryResult(
         result_id=_history_text(result, "result_id"),
         final_name=_history_text(result, "final_name"),
@@ -555,6 +559,8 @@ def parse_history_run(value: object) -> HistoryRun:
     run = _history_object(value, "run")
     _validate_history_run_fields(run)
     status = _history_text(run, "status")
+    if status not in VALID_RUN_STATUSES:
+        raise ValueError(f"run.status 不受支持：{status}")
     snapshot = run.get("history_snapshot")
     has_complete_details = False
     results: tuple[HistoryResult, ...] = ()

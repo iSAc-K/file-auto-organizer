@@ -125,11 +125,46 @@ class LauncherCoreTests(unittest.TestCase):
 
         self.assertEqual(parsed.status_text, "执行中断")
 
-    def test_unknown_status_uses_original_value_or_unknown(self):
-        run = self.complete_history_run(status="custom")
-        self.assertEqual(launcher_core.parse_history_run(run).status_text, "custom")
-        run["status"] = ""
-        self.assertEqual(launcher_core.parse_history_run(run).status_text, "未知")
+    def test_schema_v1_rejects_invalid_run_statuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for status in ("", "custom", "pending", "skipped"):
+                with self.subTest(status=status):
+                    self.write_history_log(
+                        root,
+                        [self.complete_history_run(status=status)],
+                    )
+
+                    state = launcher_core.load_apply_history(root)
+
+                    self.assertEqual(state.runs, ())
+                    self.assertIn("organizer_run_log.json", state.error)
+
+    def test_schema_v1_rejects_invalid_result_statuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for status in ("", "custom", "running", "partial"):
+                with self.subTest(status=status):
+                    run = self.complete_history_run()
+                    run["history_snapshot"]["results"][0]["status"] = status
+                    self.write_history_log(root, [run])
+
+                    state = launcher_core.load_apply_history(root)
+
+                    self.assertEqual(state.runs, ())
+                    self.assertIn("organizer_run_log.json", state.error)
+
+    def test_legacy_run_without_snapshot_rejects_invalid_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_run = self.complete_history_run(status="")
+            legacy_run.pop("history_snapshot")
+            self.write_history_log(root, [legacy_run])
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(state.runs, ())
+            self.assertIn("organizer_run_log.json", state.error)
 
     def test_load_apply_history_missing_file_is_empty_and_not_created(self):
         with tempfile.TemporaryDirectory() as tmp:
