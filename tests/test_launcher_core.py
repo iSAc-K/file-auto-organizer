@@ -65,7 +65,7 @@ class LauncherCoreTests(unittest.TestCase):
             "merged": True,
             "date": "0501-0502",
             "category": "军牌",
-            "orders": "3",
+            "orders": 3,
             "quantity": 5,
             "matched_keywords": ["军牌", "金属军牌"],
             "status": "success",
@@ -190,6 +190,144 @@ class LauncherCoreTests(unittest.TestCase):
             self.assertEqual(state.runs, ())
             self.assertIn("organizer_run_log.json 无法读取", state.error)
 
+    def test_invalid_snapshot_field_types_discard_all_runs(self):
+        mutations = {
+            "merged string": lambda run: run["history_snapshot"]["results"][0].__setitem__(
+                "merged", "false"
+            ),
+            "orders string": lambda run: run["history_snapshot"]["results"][0].__setitem__(
+                "orders", "3"
+            ),
+            "result text number": lambda run: run["history_snapshot"]["results"][0].__setitem__(
+                "final_name", 123
+            ),
+            "source text number": lambda run: run["history_snapshot"]["results"][0][
+                "source_items"
+            ][0].__setitem__("original_name", 123),
+            "keyword non-string": lambda run: run["history_snapshot"]["results"][0].__setitem__(
+                "matched_keywords", ["军牌", 123]
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    bad = self.complete_history_run(run_id="bad")
+                    mutate(bad)
+                    self.write_history_log(
+                        root,
+                        [self.complete_history_run(run_id="good"), bad],
+                    )
+
+                    state = launcher_core.load_apply_history(root)
+
+                    self.assertEqual(state.runs, ())
+                    self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_all_history_text_fields_require_strings(self):
+        fields = (
+            ("run", "run_id"),
+            ("run", "time"),
+            ("run", "root"),
+            ("run", "status"),
+            ("result", "result_id"),
+            ("result", "final_name"),
+            ("result", "target_path"),
+            ("result", "date"),
+            ("result", "category"),
+            ("result", "status"),
+            ("result", "error_reason"),
+            ("source", "original_name"),
+            ("source", "source_type"),
+            ("source", "source_path"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for location, field in fields:
+                with self.subTest(location=location, field=field):
+                    bad = self.complete_history_run()
+                    if location == "run":
+                        bad[field] = 123
+                    elif location == "result":
+                        bad["history_snapshot"]["results"][0][field] = 123
+                    else:
+                        bad["history_snapshot"]["results"][0]["source_items"][0][field] = 123
+                    self.write_history_log(root, [bad])
+
+                    state = launcher_core.load_apply_history(root)
+
+                    self.assertEqual(state.runs, ())
+                    self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_all_schema_v1_fields_are_required(self):
+        fields = (
+            ("run", "run_id"),
+            ("run", "time"),
+            ("run", "root"),
+            ("run", "status"),
+            ("result", "result_id"),
+            ("result", "final_name"),
+            ("result", "target_path"),
+            ("result", "source_items"),
+            ("result", "merged"),
+            ("result", "date"),
+            ("result", "category"),
+            ("result", "orders"),
+            ("result", "quantity"),
+            ("result", "matched_keywords"),
+            ("result", "status"),
+            ("result", "error_reason"),
+            ("source", "original_name"),
+            ("source", "source_type"),
+            ("source", "source_path"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for location, field in fields:
+                with self.subTest(location=location, field=field):
+                    bad = self.complete_history_run()
+                    if location == "run":
+                        bad.pop(field)
+                    elif location == "result":
+                        bad["history_snapshot"]["results"][0].pop(field)
+                    else:
+                        bad["history_snapshot"]["results"][0]["source_items"][0].pop(field)
+                    self.write_history_log(root, [bad])
+
+                    state = launcher_core.load_apply_history(root)
+
+                    self.assertEqual(state.runs, ())
+                    self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_counts_require_exact_integer_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for field in ("orders", "quantity"):
+                for value in (True, 3.0, "3"):
+                    with self.subTest(field=field, value=value):
+                        bad = self.complete_history_run()
+                        bad["history_snapshot"]["results"][0][field] = value
+                        self.write_history_log(root, [bad])
+
+                        state = launcher_core.load_apply_history(root)
+
+                        self.assertEqual(state.runs, ())
+                        self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_merged_requires_exact_boolean_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for value in (0, 1, "false"):
+                with self.subTest(value=value):
+                    bad = self.complete_history_run()
+                    bad["history_snapshot"]["results"][0]["merged"] = value
+                    self.write_history_log(root, [bad])
+
+                    state = launcher_core.load_apply_history(root)
+
+                    self.assertEqual(state.runs, ())
+                    self.assertIn("organizer_run_log.json 无法读取", state.error)
+
     def test_non_object_run_discards_all_runs_with_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -248,6 +386,103 @@ class LauncherCoreTests(unittest.TestCase):
             self.assertEqual(
                 [run.run_id for run in state.runs],
                 ["legacy-apply", "old-apply"],
+            )
+
+    def test_non_string_mode_discards_all_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_history_log(
+                root,
+                [self.complete_history_run(run_id="good"), self.complete_history_run(mode=True)],
+            )
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(state.runs, ())
+            self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_valid_non_apply_mode_is_filtered_without_hiding_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_history_log(
+                root,
+                [
+                    self.complete_history_run(run_id="apply"),
+                    self.complete_history_run(run_id="dry", mode="dry-run"),
+                    self.complete_history_run(run_id="undo", mode="undo-last"),
+                ],
+            )
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual([run.run_id for run in state.runs], ["apply"])
+            self.assertEqual(state.error, "")
+
+    def test_filtered_run_still_requires_valid_top_level_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            invalid_dry_run = self.complete_history_run(mode="dry-run")
+            invalid_dry_run["run_id"] = 123
+            self.write_history_log(
+                root,
+                [self.complete_history_run(run_id="apply"), invalid_dry_run],
+            )
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(state.runs, ())
+            self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_file_helper_snapshot_round_trips_through_history_loader(self):
+        from file_helper import PlanGroup, WorkItem, build_history_snapshot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = WorkItem("folder", "0501 军牌 1单2个", root / "first", root)
+            second = WorkItem("archive", "0502 军牌 2单3个.zip", root / "second", root)
+            first.detection.matched_keyword = "军牌"
+            second.detection.matched_keyword = "金属军牌"
+            group = PlanGroup(
+                items=[first, second],
+                is_merge=True,
+                sequence_range="1~2",
+                date_label="0501-0502",
+                category="军牌",
+                orders=3,
+                quantity=5,
+                final_name="1~2-0501-0502-军牌-3单-5个",
+                target_path=root / "1~2-0501-0502-军牌-3单-5个",
+                naming_template="",
+                reason="test",
+            )
+            snapshot = build_history_snapshot([group])
+            snapshot["results"][0]["status"] = "success"
+            self.write_history_log(
+                root,
+                [
+                    {
+                        "run_id": "producer-run",
+                        "mode": "apply",
+                        "time": "2026-06-15 12:00:00",
+                        "root": str(root.resolve()),
+                        "status": "success",
+                        "history_snapshot": snapshot,
+                    }
+                ],
+            )
+
+            state = launcher_core.load_apply_history(root)
+
+            result = state.runs[0].results[0]
+            self.assertEqual(state.error, "")
+            self.assertEqual(result.final_name, group.final_name)
+            self.assertEqual(result.target_path, str(group.target_path.resolve()))
+            self.assertEqual(result.orders, group.orders)
+            self.assertEqual(result.quantity, group.quantity)
+            self.assertEqual(result.matched_keywords, ("军牌", "金属军牌"))
+            self.assertEqual(
+                tuple(item.original_name for item in result.source_items),
+                (first.original_name, second.original_name),
             )
 
     def test_source_items_and_matched_keywords_must_be_lists(self):

@@ -483,37 +483,39 @@ def _history_object(value: object, label: str) -> dict[str, Any]:
     return value
 
 
-def _history_text(value: object) -> str:
-    if value is None:
-        return ""
-    if not isinstance(value, (str, int, float, bool)):
-        raise ValueError("历史文本字段类型无效。")
-    return str(value)
+def _history_text(data: dict[str, Any], field: str) -> str:
+    if field not in data or type(data[field]) is not str:
+        raise ValueError(f"{field} 必须是字符串。")
+    return data[field]
 
 
-def _history_int(value: object, label: str) -> int:
-    if value is None or value == "":
-        return 0
-    if isinstance(value, bool):
-        raise ValueError(f"{label} 必须是整数。")
-    if isinstance(value, float) and not value.is_integer():
-        raise ValueError(f"{label} 必须是整数。")
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} 必须是整数。") from exc
+def _history_int(data: dict[str, Any], field: str) -> int:
+    if field not in data or type(data[field]) is not int:
+        raise ValueError(f"{field} 必须是整数。")
+    return data[field]
+
+
+def _history_bool(data: dict[str, Any], field: str) -> bool:
+    if field not in data or type(data[field]) is not bool:
+        raise ValueError(f"{field} 必须是布尔值。")
+    return data[field]
 
 
 def _history_status_text(status: str, mapping: dict[str, str]) -> str:
     return mapping.get(status, status or "未知")
 
 
+def _validate_history_run_fields(run: dict[str, Any]) -> None:
+    for field in ("run_id", "time", "root", "status"):
+        _history_text(run, field)
+
+
 def parse_history_source_item(value: object) -> HistorySourceItem:
     item = _history_object(value, "source_item")
     return HistorySourceItem(
-        original_name=_history_text(item.get("original_name")),
-        source_type=_history_text(item.get("source_type")),
-        source_path=_history_text(item.get("source_path")),
+        original_name=_history_text(item, "original_name"),
+        source_type=_history_text(item, "source_type"),
+        source_path=_history_text(item, "source_path"),
     )
 
 
@@ -525,29 +527,33 @@ def parse_history_result(value: object) -> HistoryResult:
     matched_keywords = result.get("matched_keywords")
     if not isinstance(matched_keywords, list):
         raise ValueError("matched_keywords 必须是列表。")
-    status = _history_text(result.get("status"))
+    parsed_keywords = []
+    for keyword in matched_keywords:
+        if type(keyword) is not str:
+            raise ValueError("matched_keywords 每项必须是字符串。")
+        parsed_keywords.append(keyword)
+    status = _history_text(result, "status")
     return HistoryResult(
-        result_id=_history_text(result.get("result_id")),
-        final_name=_history_text(result.get("final_name")),
-        target_path=_history_text(result.get("target_path")),
+        result_id=_history_text(result, "result_id"),
+        final_name=_history_text(result, "final_name"),
+        target_path=_history_text(result, "target_path"),
         source_items=tuple(parse_history_source_item(item) for item in source_items),
-        merged=bool(result.get("merged", False)),
-        date=_history_text(result.get("date")),
-        category=_history_text(result.get("category")),
-        orders=_history_int(result.get("orders"), "orders"),
-        quantity=_history_int(result.get("quantity"), "quantity"),
-        matched_keywords=tuple(
-            _history_text(keyword) for keyword in matched_keywords
-        ),
+        merged=_history_bool(result, "merged"),
+        date=_history_text(result, "date"),
+        category=_history_text(result, "category"),
+        orders=_history_int(result, "orders"),
+        quantity=_history_int(result, "quantity"),
+        matched_keywords=tuple(parsed_keywords),
         status=status,
         status_text=_history_status_text(status, RESULT_STATUS_TEXT),
-        error_reason=_history_text(result.get("error_reason")),
+        error_reason=_history_text(result, "error_reason"),
     )
 
 
 def parse_history_run(value: object) -> HistoryRun:
     run = _history_object(value, "run")
-    status = _history_text(run.get("status"))
+    _validate_history_run_fields(run)
+    status = _history_text(run, "status")
     snapshot = run.get("history_snapshot")
     has_complete_details = False
     results: tuple[HistoryResult, ...] = ()
@@ -559,9 +565,9 @@ def parse_history_run(value: object) -> HistoryRun:
         results = tuple(parse_history_result(result) for result in raw_results)
         has_complete_details = True
     return HistoryRun(
-        run_id=_history_text(run.get("run_id")),
-        time=_history_text(run.get("time")),
-        root=_history_text(run.get("root")),
+        run_id=_history_text(run, "run_id"),
+        time=_history_text(run, "time"),
+        root=_history_text(run, "root"),
         status=status,
         status_text=_history_status_text(status, RUN_STATUS_TEXT),
         has_complete_details=has_complete_details,
@@ -584,7 +590,11 @@ def load_apply_history(root_path: str | Path) -> ApplyHistoryState:
         parsed_runs = []
         for raw_run in reversed(raw_runs):
             run = _history_object(raw_run, "run")
-            if run.get("mode", "apply") == "apply":
+            _validate_history_run_fields(run)
+            mode = run.get("mode", "apply")
+            if type(mode) is not str:
+                raise ValueError("mode 必须是字符串。")
+            if mode == "apply":
                 parsed_runs.append(parse_history_run(run))
         runs = tuple(parsed_runs)
         return ApplyHistoryState(runs=runs)
