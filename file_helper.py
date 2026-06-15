@@ -576,7 +576,7 @@ def history_result_id(index: int) -> str:
 def build_history_source_item(item: WorkItem) -> Dict[str, Any]:
     source_path = item.archive_path if item.source_type == "archive" and item.archive_path else item.current_path
     return {
-        "source_name": item.original_name,
+        "original_name": item.original_name,
         "source_path": absolute_text(source_path),
         "source_type": item.source_type,
     }

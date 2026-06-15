@@ -139,7 +139,7 @@ class FileHelperCoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         self.assertEqual(result["error_reason"], "")
         self.assertEqual(
-            [item["source_name"] for item in result["source_items"]],
+            [item["original_name"] for item in result["source_items"]],
             ["0501 军牌钥匙扣 1单2个", "0505 军牌钥匙扣 2单3个"],
         )
 
@@ -170,7 +170,37 @@ class FileHelperCoreTests(unittest.TestCase):
 
             source_item = build_history_source_item(item)
 
+        self.assertEqual(source_item["original_name"], item.original_name)
+        self.assertNotIn("source_name", source_item)
         self.assertEqual(source_item["source_path"], absolute_text(item.archive_path))
+
+    def test_build_history_snapshot_assigns_unique_result_ids_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            groups = []
+            for index in range(2):
+                item = WorkItem("folder", f"source-{index}", root / f"source-{index}", root)
+                groups.append(
+                    PlanGroup(
+                        items=[item],
+                        is_merge=False,
+                        sequence_range=str(index + 1),
+                        date_label=f"050{index + 1}",
+                        category=f"category-{index}",
+                        orders=1,
+                        quantity=1,
+                        final_name=f"result-{index}",
+                        target_path=root / f"result-{index}",
+                        naming_template="",
+                        reason="test",
+                    )
+                )
+
+            snapshot = build_history_snapshot(groups)
+
+        result_ids = [result["result_id"] for result in snapshot["results"]]
+        self.assertEqual(result_ids, ["result-1", "result-2"])
+        self.assertEqual(len(result_ids), len(set(result_ids)))
 
     def test_build_history_snapshot_deduplicates_keywords_in_source_order(self):
         with tempfile.TemporaryDirectory() as tmp:
