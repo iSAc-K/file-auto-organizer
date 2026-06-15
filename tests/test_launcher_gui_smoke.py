@@ -340,14 +340,15 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         self.assertFalse(self.gui.history_result_table.item(parent, "open"))
         children = self.gui.history_result_table.get_children(parent)
         self.assertEqual(len(children), 2)
-        source_values = self.gui.history_result_table.item(children[0], "values")
-        self.assertIn("来源：0615 mouse source", source_values)
-        self.assertIn("C:/history-root/0615 mouse source", source_values)
-        self.assertIn("folder", source_values)
-        self.assertIn(
-            "原因：target exists",
-            self.gui.history_result_table.item(children[1], "values"),
-        )
+        source_item = self.gui.history_result_table.item(children[0])
+        self.assertEqual(source_item["text"], "来源：0615 mouse source")
+        self.assertEqual(source_item["values"][1], "C:/history-root/0615 mouse source")
+        self.assertEqual(source_item["values"][4], "")
+        self.assertEqual(source_item["values"][6], "来源类型：folder")
+        reason_item = self.gui.history_result_table.item(children[1])
+        self.assertEqual(reason_item["text"], "原因：target exists")
+        self.assertEqual(len(reason_item["values"]), 10)
+        self.assertTrue(all(value == "" for value in reason_item["values"]))
         self.assertEqual(self.gui.history_detail_message.cget("text"), "")
 
     def test_history_result_without_error_has_no_reason_child(self):
@@ -359,9 +360,15 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         parent = self.gui.history_result_table.get_children()[0]
         children = self.gui.history_result_table.get_children(parent)
         self.assertEqual(len(children), 1)
-        self.assertTrue(
-            self.gui.history_result_table.item(children[0], "values")[0].startswith("来源：")
+        self.assertEqual(
+            self.gui.history_result_table.item(children[0], "text"),
+            "来源：0615 mouse source",
         )
+
+    def test_history_tables_have_horizontal_and_vertical_scroll_commands(self):
+        for table in (self.gui.history_list, self.gui.history_result_table):
+            self.assertTrue(table.cget("xscrollcommand"))
+            self.assertTrue(table.cget("yscrollcommand"))
 
     def test_legacy_history_run_uses_exact_message_and_empty_table(self):
         run = self.make_history_run(complete=False)

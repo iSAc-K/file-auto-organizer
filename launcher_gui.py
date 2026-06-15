@@ -553,13 +553,13 @@ class LauncherGui:
     @staticmethod
     def _history_source_values(source: HistorySourceItem) -> tuple[str, ...]:
         return (
-            f"来源：{source.original_name}",
+            "",
             source.source_path,
             "",
             "",
-            source.source_type,
             "",
             "",
+            f"来源类型：{source.source_type}",
             "",
             "",
             "",
@@ -590,13 +590,15 @@ class LauncherGui:
                 self.history_result_table.insert(
                     parent,
                     "end",
+                    text=f"来源：{source.original_name}",
                     values=self._history_source_values(source),
                 )
             if result.error_reason:
                 self.history_result_table.insert(
                     parent,
                     "end",
-                    values=(f"原因：{result.error_reason}", "", "", "", "", "", "", "", "", ""),
+                    text=f"原因：{result.error_reason}",
+                    values=("", "", "", "", "", "", "", "", "", ""),
                 )
 
     def _build_history_page(self, parent: ctk.CTkFrame) -> None:
@@ -630,8 +632,13 @@ class LauncherGui:
         list_card.grid_columnconfigure(0, weight=1)
         list_card.grid_rowconfigure(0, weight=1)
 
+        history_list_frame = ctk.CTkFrame(list_card, fg_color="transparent")
+        history_list_frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        history_list_frame.grid_columnconfigure(0, weight=1)
+        history_list_frame.grid_rowconfigure(0, weight=1)
+
         self.history_list = ttk.Treeview(
-            list_card,
+            history_list_frame,
             columns=("time", "root", "status"),
             show="headings",
             selectmode="browse",
@@ -640,9 +647,25 @@ class LauncherGui:
         self.history_list.heading("root", text="根目录")
         self.history_list.heading("status", text="状态")
         self.history_list.column("time", width=150, minwidth=120, stretch=False)
-        self.history_list.column("root", width=280, minwidth=160, stretch=True)
+        self.history_list.column("root", width=280, minwidth=160, stretch=False)
         self.history_list.column("status", width=90, minwidth=70, stretch=False)
-        self.history_list.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        history_list_y = ttk.Scrollbar(
+            history_list_frame,
+            orient="vertical",
+            command=self.history_list.yview,
+        )
+        history_list_x = ttk.Scrollbar(
+            history_list_frame,
+            orient="horizontal",
+            command=self.history_list.xview,
+        )
+        self.history_list.configure(
+            yscrollcommand=history_list_y.set,
+            xscrollcommand=history_list_x.set,
+        )
+        self.history_list.grid(row=0, column=0, sticky="nsew")
+        history_list_y.grid(row=0, column=1, sticky="ns")
+        history_list_x.grid(row=1, column=0, sticky="ew")
         self.history_list.bind("<<TreeviewSelect>>", self.on_history_run_selected)
 
         detail_card = ctk.CTkFrame(
@@ -701,7 +724,7 @@ class LauncherGui:
         )
         result_widths = (170, 220, 58, 52, 72, 62, 78, 52, 52, 120)
         self.history_result_table.heading("#0", text="")
-        self.history_result_table.column("#0", width=24, minwidth=24, stretch=False)
+        self.history_result_table.column("#0", width=190, minwidth=120, stretch=False)
         for column, heading, width in zip(result_columns, result_headings, result_widths):
             self.history_result_table.heading(column, text=heading)
             self.history_result_table.column(
