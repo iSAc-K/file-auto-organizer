@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import file_helper
 from file_helper import (
     DEFAULT_CONFIG,
     PlanGroup,
@@ -251,6 +253,95 @@ class FileHelperCoreTests(unittest.TestCase):
 
         self.assertFalse(snapshot["results"][0]["merged"])
 
+    def test_create_apply_run_persists_snapshot_and_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mkdir(root / "0507 history source")
+            _items, groups = build_plan(root, test_config(), "apply", root / "rename_log.csv")
+
+            _data, run = create_apply_run(root, root / RUN_LOG_NAME, groups)
+
+        self.assertEqual(run["mode"], "apply")
+        self.assertEqual(run["history_snapshot"], build_history_snapshot(groups))
+
+    def test_update_history_result_persists_status_and_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mkdir(root / "0507 history source")
+            _items, groups = build_plan(root, test_config(), "apply", root / "rename_log.csv")
+            data, run = create_apply_run(root, root / RUN_LOG_NAME, groups)
+
+            file_helper.update_history_result(
+                root / RUN_LOG_NAME,
+                data,
+                run,
+                "result-1",
+                "skipped",
+                "target exists",
+            )
+
+            saved = load_run_log(root / RUN_LOG_NAME)["runs"][0]["history_snapshot"]["results"][0]
+
+        self.assertEqual(saved["status"], "skipped")
+        self.assertEqual(saved["error_reason"], "target exists")
+
+    def test_run_log_keeps_only_latest_one_hundred_apply_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_log_path = Path(tmp) / RUN_LOG_NAME
+            runs = [
+                {
+                    "run_id": f"run-{index}",
+                    "root": str(Path(tmp).resolve()),
+                    "time": f"2026-06-15 00:{index:02d}:00",
+                    "status": "success",
+                    "operations": [],
+                }
+                for index in range(101)
+            ]
+
+            safe_write_run_log(run_log_path, {"runs": runs})
+
+            saved = load_run_log(run_log_path)["runs"]
+
+        self.assertEqual(len(saved), 100)
+        self.assertEqual(saved[0]["run_id"], "run-1")
+        self.assertEqual(saved[-1]["run_id"], "run-100")
+
+    def test_run_log_pruning_preserves_non_apply_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_log_path = Path(tmp) / RUN_LOG_NAME
+            runs = [{"run_id": "dry-run", "mode": "dry-run"}]
+            runs.extend(
+                {"run_id": f"apply-{index}", "mode": "apply"}
+                for index in range(101)
+            )
+
+            safe_write_run_log(run_log_path, {"runs": runs})
+
+            saved = load_run_log(run_log_path)["runs"]
+
+        self.assertEqual(len(saved), 101)
+        self.assertEqual(saved[0]["run_id"], "dry-run")
+        self.assertEqual(saved[1]["run_id"], "apply-1")
+        self.assertEqual(saved[-1]["run_id"], "apply-100")
+
+    def test_safe_write_run_log_failure_preserves_existing_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_log_path = Path(tmp) / RUN_LOG_NAME
+            original = {"runs": [{"run_id": "original", "mode": "apply"}]}
+            safe_write_run_log(run_log_path, original)
+
+            with patch("file_helper.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaises(file_helper.RunLogWriteError):
+                    safe_write_run_log(
+                        run_log_path,
+                        {"runs": [{"run_id": "replacement", "mode": "apply"}]},
+                    )
+
+            saved = load_run_log(run_log_path)
+
+        self.assertEqual(saved, original)
+
     def test_generated_merge_folder_requires_explicit_merge_sequence_separator(self):
         cases = {
             "06-03-HYX-NP图片项链-6单-13个": False,
@@ -355,7 +446,7 @@ class FileHelperCoreTests(unittest.TestCase):
             run_log_path = root / RUN_LOG_NAME
 
             _items, groups = build_plan(root, test_config(), "apply", log_path)
-            run_log_data, run = create_apply_run(root, run_log_path)
+            run_log_data, run = create_apply_run(root, run_log_path, groups)
             completed, failed_count = apply_plan(groups, log_path, run_log_path, run_log_data, run)
 
             self.assertEqual(completed, [])
@@ -363,9 +454,145 @@ class FileHelperCoreTests(unittest.TestCase):
             self.assertTrue(source_one.exists())
             self.assertTrue(source_two.exists())
             self.assertEqual((target / "existing.txt").read_text(encoding="utf-8"), "existing")
-            self.assertEqual(load_run_log(run_log_path)["runs"][0]["operations"], [])
+            saved_run = load_run_log(run_log_path)["runs"][0]
+            self.assertEqual(saved_run["operations"], [])
+            result = saved_run["history_snapshot"]["results"][0]
+            self.assertEqual(result["status"], "skipped")
+            self.assertIn("conflict.target_exists=skip", result["error_reason"])
             rows = read_log_rows(log_path)
             self.assertTrue(any(row["action"] == "skip" and row["status"] == "skipped" for row in rows))
+
+    def test_apply_plan_marks_completed_group_success_in_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mkdir(root / "0507 completed source")
+            log_path = root / "rename_log.csv"
+            run_log_path = root / RUN_LOG_NAME
+            _items, groups = build_plan(root, test_config(), "apply", log_path)
+            run_log_data, run = create_apply_run(root, run_log_path, groups)
+
+            completed, failed_count = apply_plan(
+                groups,
+                log_path,
+                run_log_path,
+                run_log_data,
+                run,
+            )
+
+            result = load_run_log(run_log_path)["runs"][0]["history_snapshot"]["results"][0]
+
+        self.assertEqual(failed_count, 0)
+        self.assertEqual(completed, groups)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["error_reason"], "")
+
+    def test_apply_plan_marks_failed_result_by_result_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing_source = root / "missing-source"
+            valid_source = mkdir(root / "valid-source")
+            groups = [
+                PlanGroup(
+                    items=[WorkItem("folder", source.name, source, root)],
+                    is_merge=False,
+                    sequence_range=str(index),
+                    date_label="",
+                    category="",
+                    orders=1,
+                    quantity=1,
+                    final_name=f"target-{index}",
+                    target_path=root / f"target-{index}",
+                    naming_template="",
+                    reason="test",
+                )
+                for index, source in enumerate((missing_source, valid_source), start=1)
+            ]
+            run_log_path = root / RUN_LOG_NAME
+            data, run = create_apply_run(root, run_log_path, groups)
+
+            completed, failed_count = apply_plan(
+                groups,
+                root / "rename_log.csv",
+                run_log_path,
+                data,
+                run,
+            )
+
+            results = load_run_log(run_log_path)["runs"][0]["history_snapshot"]["results"]
+
+        self.assertEqual(failed_count, 1)
+        self.assertEqual(completed, [groups[1]])
+        self.assertEqual(results[0]["result_id"], "result-1")
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertTrue(results[0]["error_reason"])
+        self.assertEqual(results[1]["result_id"], "result-2")
+        self.assertEqual(results[1]["status"], "success")
+
+    def test_apply_plan_log_write_failure_prevents_second_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_one = mkdir(root / "source-one")
+            source_two = mkdir(root / "source-two")
+            groups = [
+                PlanGroup(
+                    items=[WorkItem("folder", source.name, source, root)],
+                    is_merge=False,
+                    sequence_range=str(index),
+                    date_label="",
+                    category="",
+                    orders=1,
+                    quantity=1,
+                    final_name=f"target-{index}",
+                    target_path=root / f"target-{index}",
+                    naming_template="",
+                    reason="test",
+                )
+                for index, source in enumerate((source_one, source_two), start=1)
+            ]
+            run_log_path = root / RUN_LOG_NAME
+            data, run = create_apply_run(root, run_log_path, groups)
+
+            with patch(
+                "file_helper.safe_write_run_log",
+                side_effect=file_helper.RunLogWriteError("write failed"),
+            ):
+                with self.assertRaises(file_helper.RunLogWriteError):
+                    apply_plan(
+                        groups,
+                        root / "rename_log.csv",
+                        run_log_path,
+                        data,
+                        run,
+                    )
+
+            self.assertTrue((root / "target-1").exists())
+            self.assertFalse(source_one.exists())
+            self.assertTrue(source_two.exists())
+            self.assertFalse((root / "target-2").exists())
+
+    def test_main_log_write_failure_stops_later_groups_and_returns_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_one = mkdir(root / "0501 first source")
+            source_two = mkdir(root / "0502 second source")
+            original_safe_write = file_helper.safe_write_run_log
+            write_count = 0
+
+            def fail_after_run_creation(run_log_path, data):
+                nonlocal write_count
+                write_count += 1
+                if write_count == 1:
+                    return original_safe_write(run_log_path, data)
+                raise file_helper.RunLogWriteError("write failed")
+
+            with patch("file_helper.safe_write_run_log", side_effect=fail_after_run_creation):
+                result = main(["--root", str(root), "--apply", "--yes"])
+
+            self.assertEqual(result, 1)
+            self.assertFalse(source_one.exists())
+            self.assertTrue((root / "1-0501 first source").exists())
+            self.assertTrue(source_two.exists())
+            self.assertFalse((root / "2-0502 second source").exists())
 
     def test_undo_uses_run_log_and_does_not_overwrite_existing_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -406,7 +633,7 @@ class FileHelperCoreTests(unittest.TestCase):
             run_log_path = root / RUN_LOG_NAME
 
             _items, groups = build_plan(root, test_config(), "apply", log_path)
-            run_log_data, run = create_apply_run(root, run_log_path)
+            run_log_data, run = create_apply_run(root, run_log_path, groups)
             completed, failed_count = apply_plan(groups, log_path, run_log_path, run_log_data, run)
             update_run_status(run_log_path, run_log_data, run, "success")
             zip_path = zip_path_for_folder(completed[0].target_path)
@@ -483,7 +710,7 @@ class FileHelperCoreTests(unittest.TestCase):
             run_log_path = root / RUN_LOG_NAME
 
             _items, groups = build_plan(root, test_config(), "apply", log_path)
-            run_log_data, run = create_apply_run(root, run_log_path)
+            run_log_data, run = create_apply_run(root, run_log_path, groups)
             completed, _failed_count = apply_plan(groups, log_path, run_log_path, run_log_data, run)
             zip_path = zip_path_for_folder(completed[0].target_path)
             zip_path.write_text("existing zip placeholder", encoding="utf-8")
