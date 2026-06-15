@@ -25,6 +25,7 @@ UpdateStatus = Literal[
     "updater_started",
 ]
 VALID_MODES: set[str] = {"dry-run", "apply", "undo-last"}
+VALID_HISTORY_MODES: set[str] = {"apply", "dry-run", "undo-last"}
 PREVIEW_COLUMN_WIDTHS = {
     "序号": 48,
     "原文件夹": 210,
@@ -594,6 +595,8 @@ def load_apply_history(root_path: str | Path) -> ApplyHistoryState:
             mode = run.get("mode", "apply")
             if type(mode) is not str:
                 raise ValueError("mode 必须是字符串。")
+            if mode not in VALID_HISTORY_MODES:
+                raise ValueError(f"mode 不受支持：{mode}")
             if mode == "apply":
                 parsed_runs.append(parse_history_run(run))
         runs = tuple(parsed_runs)

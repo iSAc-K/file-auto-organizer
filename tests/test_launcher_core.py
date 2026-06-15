@@ -401,6 +401,24 @@ class LauncherCoreTests(unittest.TestCase):
             self.assertEqual(state.runs, ())
             self.assertIn("organizer_run_log.json 无法读取", state.error)
 
+    def test_unknown_string_mode_discards_all_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for mode in ("bogus", ""):
+                with self.subTest(mode=mode):
+                    self.write_history_log(
+                        root,
+                        [
+                            self.complete_history_run(run_id="good"),
+                            self.complete_history_run(run_id="bad", mode=mode),
+                        ],
+                    )
+
+                    state = launcher_core.load_apply_history(root)
+
+                    self.assertEqual(state.runs, ())
+                    self.assertIn("organizer_run_log.json 无法读取", state.error)
+
     def test_valid_non_apply_mode_is_filtered_without_hiding_apply(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
