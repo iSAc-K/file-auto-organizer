@@ -13,7 +13,10 @@ import customtkinter as ctk
 from launcher_core import (
     ApplyHistoryState,
     EMPTY_HISTORY_TEXT,
+    HistoryResult,
     HistoryRun,
+    HistorySourceItem,
+    LEGACY_HISTORY_TEXT,
     SETTINGS_NAME,
     app_base_dir,
 )
@@ -150,6 +153,59 @@ class LauncherGuiSmokeTests(unittest.TestCase):
             self.app_settings_snapshot,
         )
 
+    @staticmethod
+    def make_history_result(
+        result_id: str = "result-1",
+        final_name: str = "01-0615-mouse-2-3",
+        *,
+        merged: bool = True,
+        matched_keywords: tuple[str, ...] = ("mouse", "wireless"),
+        error_reason: str = "",
+    ) -> HistoryResult:
+        return HistoryResult(
+            result_id=result_id,
+            final_name=final_name,
+            target_path=f"C:/history-root/{final_name}",
+            source_items=(
+                HistorySourceItem(
+                    original_name="0615 mouse source",
+                    source_type="folder",
+                    source_path="C:/history-root/0615 mouse source",
+                ),
+            ),
+            merged=merged,
+            date="0615",
+            category="mouse",
+            orders=2,
+            quantity=3,
+            matched_keywords=matched_keywords,
+            status="success",
+            status_text="SUCCESS_FROM_CORE",
+            error_reason=error_reason,
+        )
+
+    @staticmethod
+    def make_history_run(
+        run_id: str = "run-1",
+        *,
+        complete: bool = True,
+        results: tuple[HistoryResult, ...] = (),
+    ) -> HistoryRun:
+        return HistoryRun(
+            run_id=run_id,
+            time="2026-06-15 10:30:00",
+            root="C:/history-root",
+            status="success",
+            status_text="RUN_STATUS_FROM_CORE",
+            has_complete_details=complete,
+            results=results,
+        )
+
+    def select_history_run(self, index: int = 0) -> None:
+        item = self.gui.history_list.get_children()[index]
+        self.gui.history_list.selection_set(item)
+        self.gui.history_list.event_generate("<<TreeviewSelect>>")
+
     def test_history_navigation_does_not_write_app_base_settings(self):
         self.gui.root_path.set("C:/history-root")
 
@@ -255,6 +311,124 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         self.assertEqual(self.gui.history_list.selection(), ())
         self.assertIs(self.gui.history_runs_by_item[items[0]], run)
         self.assertEqual(self.gui.history_detail_message.cget("text"), "请选择一条执行记录")
+
+    def test_selecting_complete_history_run_shows_all_result_fields_and_children(self):
+        result = self.make_history_result(error_reason="target exists")
+        run = self.make_history_run(results=(result,))
+        self.gui.render_history_state(ApplyHistoryState(runs=(run,)))
+
+        self.run_action(self.select_history_run)
+
+        parents = self.gui.history_result_table.get_children()
+        self.assertEqual(len(parents), 1)
+        parent = parents[0]
+        self.assertEqual(
+            self.gui.history_result_table.item(parent, "values"),
+            (
+                result.final_name,
+                result.target_path,
+                "1",
+                "是",
+                "SUCCESS_FROM_CORE",
+                "0615",
+                "mouse",
+                "2",
+                "3",
+                "mouse、wireless",
+            ),
+        )
+        self.assertFalse(self.gui.history_result_table.item(parent, "open"))
+        children = self.gui.history_result_table.get_children(parent)
+        self.assertEqual(len(children), 2)
+        source_values = self.gui.history_result_table.item(children[0], "values")
+        self.assertIn("来源：0615 mouse source", source_values)
+        self.assertIn("C:/history-root/0615 mouse source", source_values)
+        self.assertIn("folder", source_values)
+        self.assertIn(
+            "原因：target exists",
+            self.gui.history_result_table.item(children[1], "values"),
+        )
+        self.assertEqual(self.gui.history_detail_message.cget("text"), "")
+
+    def test_history_result_without_error_has_no_reason_child(self):
+        run = self.make_history_run(results=(self.make_history_result(),))
+        self.gui.render_history_state(ApplyHistoryState(runs=(run,)))
+
+        self.run_action(self.select_history_run)
+
+        parent = self.gui.history_result_table.get_children()[0]
+        children = self.gui.history_result_table.get_children(parent)
+        self.assertEqual(len(children), 1)
+        self.assertTrue(
+            self.gui.history_result_table.item(children[0], "values")[0].startswith("来源：")
+        )
+
+    def test_legacy_history_run_uses_exact_message_and_empty_table(self):
+        run = self.make_history_run(complete=False)
+        self.gui.render_history_state(ApplyHistoryState(runs=(run,)))
+
+        self.run_action(self.select_history_run)
+
+        self.assertEqual(self.gui.history_detail_message.cget("text"), LEGACY_HISTORY_TEXT)
+        self.assertEqual(self.gui.history_result_table.get_children(), ())
+
+    def test_switching_history_runs_clears_old_rows_and_supports_multiple_results(self):
+        first = self.make_history_run(
+            "run-1",
+            results=(self.make_history_result(error_reason="old reason"),),
+        )
+        second_results = (
+            self.make_history_result(
+                "result-2",
+                "02-0616-keyboard-1-1",
+                merged=False,
+                matched_keywords=(),
+            ),
+            self.make_history_result("result-3", "03-0617-mouse-4-8"),
+        )
+        second = self.make_history_run("run-2", results=second_results)
+        self.gui.render_history_state(ApplyHistoryState(runs=(first, second)))
+        self.run_action(self.select_history_run)
+
+        self.run_action(lambda: self.select_history_run(1))
+
+        parents = self.gui.history_result_table.get_children()
+        self.assertEqual(len(parents), 2)
+        self.assertEqual(
+            self.gui.history_result_table.item(parents[0], "values")[3:10],
+            ("否", "SUCCESS_FROM_CORE", "0615", "mouse", "2", "3", ""),
+        )
+        all_values = [
+            self.gui.history_result_table.item(item, "values")
+            for parent in parents
+            for item in self.gui.history_result_table.get_children(parent)
+        ]
+        self.assertFalse(
+            any("old reason" in value for values in all_values for value in values)
+        )
+
+    def test_history_selection_event_invokes_detail_handler(self):
+        run = self.make_history_run(results=(self.make_history_result(),))
+        self.gui.render_history_state(ApplyHistoryState(runs=(run,)))
+
+        self.run_action(self.select_history_run)
+
+        self.assertEqual(len(self.gui.history_result_table.get_children()), 1)
+
+    def test_history_reload_clears_selection_and_returns_to_prompt(self):
+        run = self.make_history_run(results=(self.make_history_result(),))
+        self.gui.render_history_state(ApplyHistoryState(runs=(run,)))
+        self.run_action(self.select_history_run)
+        self.assertEqual(len(self.gui.history_result_table.get_children()), 1)
+
+        self.gui.render_history_state(ApplyHistoryState(runs=(run,)))
+
+        self.assertEqual(self.gui.history_list.selection(), ())
+        self.assertEqual(self.gui.history_result_table.get_children(), ())
+        self.assertEqual(
+            self.gui.history_detail_message.cget("text"),
+            "请选择一条执行记录",
+        )
 
     def test_cancelled_config_discard_does_not_enter_history(self):
         self.run_action(self.gui.show_config_page)

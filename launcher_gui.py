@@ -33,10 +33,13 @@ from update_manager import (
 )
 from launcher_core import (
     EMPTY_HISTORY_TEXT,
+    LEGACY_HISTORY_TEXT,
     PREVIEW_COLUMN_WIDTHS,
     SETTINGS_NAME,
     ApplyHistoryState,
+    HistoryResult,
     HistoryRun,
+    HistorySourceItem,
     LauncherSettings,
     OperationGate,
     app_base_dir,
@@ -510,6 +513,7 @@ class LauncherGui:
         for item in self.history_list.get_children():
             self.history_list.delete(item)
         self.history_list.selection_remove(self.history_list.selection())
+        self._clear_history_results()
 
         if state.error:
             self.history_detail_message.configure(text=state.error)
@@ -526,6 +530,74 @@ class LauncherGui:
             )
             self.history_runs_by_item[item] = run
         self.history_detail_message.configure(text="请选择一条执行记录")
+
+    def _clear_history_results(self) -> None:
+        for item in self.history_result_table.get_children():
+            self.history_result_table.delete(item)
+
+    @staticmethod
+    def _history_result_values(result: HistoryResult) -> tuple[object, ...]:
+        return (
+            result.final_name,
+            result.target_path,
+            len(result.source_items),
+            "是" if result.merged else "否",
+            result.status_text,
+            result.date,
+            result.category,
+            result.orders,
+            result.quantity,
+            "、".join(result.matched_keywords),
+        )
+
+    @staticmethod
+    def _history_source_values(source: HistorySourceItem) -> tuple[str, ...]:
+        return (
+            f"来源：{source.original_name}",
+            source.source_path,
+            "",
+            "",
+            source.source_type,
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+
+    def on_history_run_selected(self, _event: object | None = None) -> None:
+        selection = self.history_list.selection()
+        if not selection:
+            return
+        run = self.history_runs_by_item.get(selection[0])
+        if run is None:
+            return
+
+        self._clear_history_results()
+        if not run.has_complete_details:
+            self.history_detail_message.configure(text=LEGACY_HISTORY_TEXT)
+            return
+
+        self.history_detail_message.configure(text="")
+        for result in run.results:
+            parent = self.history_result_table.insert(
+                "",
+                "end",
+                values=self._history_result_values(result),
+                open=False,
+            )
+            for source in result.source_items:
+                self.history_result_table.insert(
+                    parent,
+                    "end",
+                    values=self._history_source_values(source),
+                )
+            if result.error_reason:
+                self.history_result_table.insert(
+                    parent,
+                    "end",
+                    values=(f"原因：{result.error_reason}", "", "", "", "", "", "", "", "", ""),
+                )
 
     def _build_history_page(self, parent: ctk.CTkFrame) -> None:
         page = ctk.CTkFrame(parent, fg_color="#EEF2F4", corner_radius=0)
@@ -571,6 +643,7 @@ class LauncherGui:
         self.history_list.column("root", width=280, minwidth=160, stretch=True)
         self.history_list.column("status", width=90, minwidth=70, stretch=False)
         self.history_list.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        self.history_list.bind("<<TreeviewSelect>>", self.on_history_run_selected)
 
         detail_card = ctk.CTkFrame(
             content,
@@ -580,7 +653,7 @@ class LauncherGui:
         )
         detail_card.grid(row=0, column=1, sticky="nsew")
         detail_card.grid_columnconfigure(0, weight=1)
-        detail_card.grid_rowconfigure(0, weight=1)
+        detail_card.grid_rowconfigure(1, weight=1)
         self.history_detail_message = ctk.CTkLabel(
             detail_card,
             text=EMPTY_HISTORY_TEXT,
@@ -589,7 +662,72 @@ class LauncherGui:
             anchor="nw",
             wraplength=430,
         )
-        self.history_detail_message.grid(row=0, column=0, sticky="nsew", padx=22, pady=22)
+        self.history_detail_message.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+
+        result_frame = ctk.CTkFrame(detail_card, fg_color="transparent")
+        result_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(4, 12))
+        result_frame.grid_columnconfigure(0, weight=1)
+        result_frame.grid_rowconfigure(0, weight=1)
+
+        result_columns = (
+            "final_name",
+            "target_path",
+            "source_count",
+            "merged",
+            "status",
+            "date",
+            "category",
+            "orders",
+            "quantity",
+            "matched_keywords",
+        )
+        self.history_result_table = ttk.Treeview(
+            result_frame,
+            columns=result_columns,
+            show="tree headings",
+            selectmode="browse",
+        )
+        result_headings = (
+            "最终文件夹",
+            "目标路径",
+            "来源数",
+            "合并",
+            "状态",
+            "日期",
+            "品类",
+            "单量",
+            "数量",
+            "命中关键词",
+        )
+        result_widths = (170, 220, 58, 52, 72, 62, 78, 52, 52, 120)
+        self.history_result_table.heading("#0", text="")
+        self.history_result_table.column("#0", width=24, minwidth=24, stretch=False)
+        for column, heading, width in zip(result_columns, result_headings, result_widths):
+            self.history_result_table.heading(column, text=heading)
+            self.history_result_table.column(
+                column,
+                width=width,
+                minwidth=width,
+                stretch=False,
+            )
+
+        history_result_y = ttk.Scrollbar(
+            result_frame,
+            orient="vertical",
+            command=self.history_result_table.yview,
+        )
+        history_result_x = ttk.Scrollbar(
+            result_frame,
+            orient="horizontal",
+            command=self.history_result_table.xview,
+        )
+        self.history_result_table.configure(
+            yscrollcommand=history_result_y.set,
+            xscrollcommand=history_result_x.set,
+        )
+        self.history_result_table.grid(row=0, column=0, sticky="nsew")
+        history_result_y.grid(row=0, column=1, sticky="ns")
+        history_result_x.grid(row=1, column=0, sticky="ew")
 
     def _build_config_page(self, parent: ctk.CTkFrame) -> None:
         page = ctk.CTkFrame(parent, fg_color="#EEF2F4", corner_radius=0)
