@@ -25,6 +25,7 @@ from file_helper import (
     create_apply_run,
     deep_merge,
     detect_dates,
+    find_last_undoable_run,
     is_generated_merge_folder_name,
     load_run_log,
     main,
@@ -339,8 +340,65 @@ class FileHelperCoreTests(unittest.TestCase):
                     )
 
             saved = load_run_log(run_log_path)
+            tmp_exists = run_log_path.with_name(file_helper.RUN_LOG_TMP_NAME).exists()
 
         self.assertEqual(saved, original)
+        self.assertFalse(tmp_exists)
+
+    def test_append_operation_persists_partial_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = mkdir(root / "source")
+            target = root / "target"
+            group = PlanGroup(
+                items=[WorkItem("folder", source.name, source, root)],
+                is_merge=False,
+                sequence_range="1",
+                date_label="",
+                category="",
+                orders=1,
+                quantity=1,
+                final_name=target.name,
+                target_path=target,
+                naming_template="",
+                reason="test",
+            )
+            run_log_path = root / RUN_LOG_NAME
+            data, run = create_apply_run(root, run_log_path, [group])
+
+            file_helper.append_run_operation(
+                run_log_path,
+                data,
+                run,
+                make_operation("move", source, target),
+            )
+
+            saved_run = load_run_log(run_log_path)["runs"][0]
+
+        self.assertEqual(saved_run["status"], "partial")
+        self.assertEqual(len(saved_run["operations"]), 1)
+
+    def test_append_operation_write_failure_restores_memory_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_log_path = root / RUN_LOG_NAME
+            run = {"status": "running", "operations": []}
+            data = {"runs": [run]}
+
+            with patch(
+                "file_helper.safe_write_run_log",
+                side_effect=file_helper.RunLogWriteError("write failed"),
+            ):
+                with self.assertRaises(file_helper.RunLogWriteError):
+                    file_helper.append_run_operation(
+                        run_log_path,
+                        data,
+                        run,
+                        {"action": "move"},
+                    )
+
+        self.assertEqual(run["status"], "running")
+        self.assertEqual(run["operations"], [])
 
     def test_generated_merge_folder_requires_explicit_merge_sequence_separator(self):
         cases = {
@@ -528,7 +586,7 @@ class FileHelperCoreTests(unittest.TestCase):
         self.assertEqual(results[1]["result_id"], "result-2")
         self.assertEqual(results[1]["status"], "success")
 
-    def test_apply_plan_log_write_failure_prevents_second_group(self):
+    def test_first_rename_operation_write_failure_rolls_back_and_stops(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source_one = mkdir(root / "source-one")
@@ -565,10 +623,188 @@ class FileHelperCoreTests(unittest.TestCase):
                         run,
                     )
 
-            self.assertTrue((root / "target-1").exists())
-            self.assertFalse(source_one.exists())
+            saved_run = load_run_log(run_log_path)["runs"][0]
+
+            self.assertFalse((root / "target-1").exists())
+            self.assertTrue(source_one.exists())
             self.assertTrue(source_two.exists())
             self.assertFalse((root / "target-2").exists())
+            self.assertEqual(saved_run["operations"], [])
+            self.assertEqual(saved_run["status"], "running")
+
+    def test_create_dir_operation_write_failure_removes_empty_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_one = mkdir(root / "source-one")
+            source_two = mkdir(root / "source-two")
+            target = root / "merged-target"
+            group = PlanGroup(
+                items=[
+                    WorkItem("folder", source.name, source, root, inner_name=f"{index}-{source.name}")
+                    for index, source in enumerate((source_one, source_two), start=1)
+                ],
+                is_merge=True,
+                sequence_range="1~2",
+                date_label="",
+                category="",
+                orders=2,
+                quantity=2,
+                final_name=target.name,
+                target_path=target,
+                naming_template="",
+                reason="test",
+            )
+            run_log_path = root / RUN_LOG_NAME
+            data, run = create_apply_run(root, run_log_path, [group])
+
+            with patch(
+                "file_helper.safe_write_run_log",
+                side_effect=file_helper.RunLogWriteError("write failed"),
+            ):
+                with self.assertRaises(file_helper.RunLogWriteError):
+                    apply_plan(
+                        [group],
+                        root / "rename_log.csv",
+                        run_log_path,
+                        data,
+                        run,
+                    )
+
+            target_exists = target.exists()
+            source_one_exists = source_one.exists()
+            source_two_exists = source_two.exists()
+
+        self.assertFalse(target_exists)
+        self.assertTrue(source_one_exists)
+        self.assertTrue(source_two_exists)
+
+    def test_failed_rename_rollback_reports_both_errors_in_human_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = mkdir(root / "source")
+            target = root / "target"
+            group = PlanGroup(
+                items=[WorkItem("folder", source.name, source, root)],
+                is_merge=False,
+                sequence_range="1",
+                date_label="",
+                category="",
+                orders=1,
+                quantity=1,
+                final_name=target.name,
+                target_path=target,
+                naming_template="",
+                reason="test",
+            )
+            log_path = root / "rename_log.csv"
+            run_log_path = root / RUN_LOG_NAME
+            data, run = create_apply_run(root, run_log_path, [group])
+
+            with patch(
+                "file_helper.safe_write_run_log",
+                side_effect=file_helper.RunLogWriteError("save failed"),
+            ):
+                with patch("file_helper.shutil.move", side_effect=OSError("rollback failed")):
+                    with self.assertRaises(file_helper.RunLogWriteError) as raised:
+                        apply_plan(
+                            [group],
+                            log_path,
+                            run_log_path,
+                            data,
+                            run,
+                        )
+
+            rows = read_log_rows(log_path)
+
+        self.assertIn("save failed", str(raised.exception))
+        self.assertIn("rollback failed", str(raised.exception))
+        self.assertTrue(
+            any(
+                row["status"] == "failed"
+                and "save failed" in row["error_message"]
+                and "rollback failed" in row["error_message"]
+                for row in rows
+            )
+        )
+
+    def test_archive_operation_write_failure_deletes_created_zip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = mkdir(root / "target")
+            (target / "file.txt").write_text("content", encoding="utf-8")
+            group = PlanGroup(
+                items=[],
+                is_merge=False,
+                sequence_range="1",
+                date_label="",
+                category="",
+                orders=1,
+                quantity=1,
+                final_name=target.name,
+                target_path=target,
+                naming_template="",
+                reason="test",
+            )
+            run_log_path = root / RUN_LOG_NAME
+            run = {"status": "partial", "operations": [{"action": "move"}]}
+            data = {"runs": [run]}
+
+            with patch(
+                "file_helper.safe_write_run_log",
+                side_effect=file_helper.RunLogWriteError("write failed"),
+            ):
+                with self.assertRaises(file_helper.RunLogWriteError):
+                    compress_groups(
+                        [group],
+                        root / "rename_log.csv",
+                        run_log_path,
+                        data,
+                        run,
+                    )
+
+            zip_exists = zip_path_for_folder(target).exists()
+
+        self.assertFalse(zip_exists)
+
+    def test_final_status_write_failure_leaves_partial_run_undoable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = mkdir(root / "source")
+            target = root / "target"
+            group = PlanGroup(
+                items=[WorkItem("folder", source.name, source, root)],
+                is_merge=False,
+                sequence_range="1",
+                date_label="",
+                category="",
+                orders=1,
+                quantity=1,
+                final_name=target.name,
+                target_path=target,
+                naming_template="",
+                reason="test",
+            )
+            run_log_path = root / RUN_LOG_NAME
+            data, run = create_apply_run(root, run_log_path, [group])
+            source.rename(target)
+            file_helper.append_run_operation(
+                run_log_path,
+                data,
+                run,
+                make_operation("move", source, target),
+            )
+
+            with patch(
+                "file_helper.safe_write_run_log",
+                side_effect=file_helper.RunLogWriteError("final status failed"),
+            ):
+                with self.assertRaises(file_helper.RunLogWriteError):
+                    file_helper.update_run_status(run_log_path, data, run, "success")
+
+            saved_data = load_run_log(run_log_path)
+
+        self.assertEqual(saved_data["runs"][0]["status"], "partial")
+        self.assertIsNotNone(find_last_undoable_run(saved_data, root))
 
     def test_main_log_write_failure_stops_later_groups_and_returns_one(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,8 +825,8 @@ class FileHelperCoreTests(unittest.TestCase):
                 result = main(["--root", str(root), "--apply", "--yes"])
 
             self.assertEqual(result, 1)
-            self.assertFalse(source_one.exists())
-            self.assertTrue((root / "1-0501 first source").exists())
+            self.assertTrue(source_one.exists())
+            self.assertFalse((root / "1-0501 first source").exists())
             self.assertTrue(source_two.exists())
             self.assertFalse((root / "2-0502 second source").exists())
 
@@ -623,6 +859,44 @@ class FileHelperCoreTests(unittest.TestCase):
             self.assertEqual(data["runs"][0]["undo_status"], "failed")
             rows = read_log_rows(root / "rename_log.csv")
             self.assertTrue(any("回退目标已存在" in row["error_message"] for row in rows))
+
+    def test_undo_final_status_write_failure_returns_one_and_logs_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_before = root / "source"
+            target_after = mkdir(root / "target")
+            run_log_path = root / RUN_LOG_NAME
+            run = {
+                "run_id": "test",
+                "mode": "apply",
+                "root": str(root.resolve()),
+                "time": "2026-06-15 00:00:00",
+                "status": "partial",
+                "undone": False,
+                "undo_time": "",
+                "undo_status": "",
+                "operations": [make_operation("move", source_before, target_after)],
+            }
+            safe_write_run_log(run_log_path, {"runs": [run]})
+            output = io.StringIO()
+
+            with patch(
+                "file_helper.update_run_undo_status",
+                side_effect=file_helper.RunLogWriteError("undo status failed"),
+            ):
+                with contextlib.redirect_stdout(output):
+                    result = undo_last(
+                        root,
+                        root / "rename_log.csv",
+                        run_log_path,
+                        confirmed=True,
+                    )
+
+            rows = read_log_rows(root / "rename_log.csv")
+
+        self.assertEqual(result, 1)
+        self.assertTrue(any(row["action"] == "undo_error" for row in rows))
+        self.assertIn("undo status failed", output.getvalue())
 
     def test_compress_groups_skips_existing_zip_without_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
