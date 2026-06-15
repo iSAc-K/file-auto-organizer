@@ -9,9 +9,13 @@ import unittest
 
 from file_helper import (
     DEFAULT_CONFIG,
+    PlanGroup,
     REPORT_NAME,
     RUN_LOG_NAME,
+    WorkItem,
+    absolute_text,
     apply_plan,
+    build_history_source_item,
     build_history_snapshot,
     build_plan,
     check_config_diagnostics,
@@ -106,6 +110,24 @@ class FileHelperCoreTests(unittest.TestCase):
         self.assertEqual(len(snapshot["results"]), 1)
         result = snapshot["results"][0]
         group = groups[0]
+        self.assertEqual(result["result_id"], "result-1")
+        self.assertEqual(
+            set(result.keys()),
+            {
+                "result_id",
+                "final_name",
+                "target_path",
+                "source_items",
+                "merged",
+                "date",
+                "category",
+                "orders",
+                "quantity",
+                "matched_keywords",
+                "status",
+                "error_reason",
+            },
+        )
         self.assertEqual(result["final_name"], group.final_name)
         self.assertEqual(result["target_path"], str(group.target_path.resolve()))
         self.assertEqual(result["date"], "0501-0505")
@@ -134,6 +156,70 @@ class FileHelperCoreTests(unittest.TestCase):
         self.assertEqual(result["orders"], 1)
         self.assertEqual(result["quantity"], 2)
         self.assertEqual(result["source_items"][0]["source_type"], "folder")
+
+    def test_build_history_source_item_uses_archive_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = WorkItem(
+                source_type="archive",
+                original_name="0507 军牌项链 1单2个",
+                current_path=root / "extracted",
+                root=root,
+                archive_path=root / "source.zip",
+            )
+
+            source_item = build_history_source_item(item)
+
+        self.assertEqual(source_item["source_path"], absolute_text(item.archive_path))
+
+    def test_build_history_snapshot_deduplicates_keywords_in_source_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            items = [
+                WorkItem("folder", f"source-{index}", root / f"source-{index}", root)
+                for index in range(4)
+            ]
+            for item, keyword in zip(items, ["甲", "乙", "甲", ""]):
+                item.detection.matched_keyword = keyword
+            group = PlanGroup(
+                items=items,
+                is_merge=True,
+                sequence_range="1~4",
+                date_label="0501-0504",
+                category="测试品类",
+                orders=4,
+                quantity=4,
+                final_name="result",
+                target_path=root / "result",
+                naming_template="",
+                reason="test",
+            )
+
+            snapshot = build_history_snapshot([group])
+
+        self.assertEqual(snapshot["results"][0]["matched_keywords"], ["甲", "乙"])
+
+    def test_build_history_snapshot_requires_multiple_sources_for_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = WorkItem("folder", "source", root / "source", root)
+            group = PlanGroup(
+                items=[item],
+                is_merge=True,
+                sequence_range="1",
+                date_label="0507",
+                category="测试品类",
+                orders=1,
+                quantity=2,
+                final_name="result",
+                target_path=root / "result",
+                naming_template="",
+                reason="test",
+            )
+
+            snapshot = build_history_snapshot([group])
+
+        self.assertFalse(snapshot["results"][0]["merged"])
 
     def test_generated_merge_folder_requires_explicit_merge_sequence_separator(self):
         cases = {
