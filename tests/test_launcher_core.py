@@ -1,8 +1,10 @@
 from pathlib import Path
+import json
 import os
 import tempfile
 import unittest
 
+import launcher_core
 from launcher_core import (
     LauncherSettings,
     OperationGate,
@@ -35,6 +37,224 @@ from update_manager import DownloadProgress
 
 
 class LauncherCoreTests(unittest.TestCase):
+    def write_history_log(self, root: Path, runs: object) -> Path:
+        path = root / "organizer_run_log.json"
+        path.write_text(
+            json.dumps({"runs": runs}, ensure_ascii=False),
+            encoding="utf-8-sig",
+        )
+        return path
+
+    def complete_history_run(self, **overrides):
+        result = {
+            "result_id": "result-1",
+            "final_name": "1~2-0501-0502-军牌-3单-5个",
+            "target_path": r"D:\orders\1~2-0501-0502-军牌-3单-5个",
+            "source_items": [
+                {
+                    "original_name": "0501 军牌 1单2个",
+                    "source_type": "folder",
+                    "source_path": r"D:\orders\0501 军牌 1单2个",
+                },
+                {
+                    "original_name": "0502 军牌 2单3个.zip",
+                    "source_type": "archive",
+                    "source_path": r"D:\orders\0502 军牌 2单3个.zip",
+                },
+            ],
+            "merged": True,
+            "date": "0501-0502",
+            "category": "军牌",
+            "orders": "3",
+            "quantity": 5,
+            "matched_keywords": ["军牌", "金属军牌"],
+            "status": "success",
+            "error_reason": "",
+        }
+        run = {
+            "run_id": "run-1",
+            "mode": "apply",
+            "time": "2026-06-15 12:00:00",
+            "root": r"D:\orders",
+            "status": "success",
+            "history_snapshot": {
+                "schema_version": 1,
+                "results": [result],
+            },
+        }
+        run.update(overrides)
+        return run
+
+    def test_parse_history_run_builds_immutable_complete_model(self):
+        run = launcher_core.parse_history_run(self.complete_history_run())
+
+        self.assertEqual(run.run_id, "run-1")
+        self.assertEqual(run.status_text, "成功")
+        self.assertTrue(run.has_complete_details)
+        self.assertIsInstance(run.results, tuple)
+        result = run.results[0]
+        self.assertEqual(result.orders, 3)
+        self.assertEqual(result.quantity, 5)
+        self.assertEqual(result.status_text, "成功")
+        self.assertIsInstance(result.source_items, tuple)
+        self.assertIsInstance(result.matched_keywords, tuple)
+        self.assertEqual(result.matched_keywords, ("军牌", "金属军牌"))
+        with self.assertRaises(Exception):
+            run.run_id = "changed"
+
+    def test_parse_legacy_running_run_has_no_guessed_details(self):
+        run = launcher_core.parse_history_run(
+            {
+                "run_id": "legacy",
+                "time": "2026-06-15 11:00:00",
+                "root": r"D:\orders",
+                "status": "running",
+            }
+        )
+
+        self.assertEqual(run.status_text, "执行中断")
+        self.assertFalse(run.has_complete_details)
+        self.assertEqual(run.results, ())
+        self.assertEqual(launcher_core.LEGACY_HISTORY_TEXT, "旧记录无完整详情")
+
+    def test_parse_pending_result_maps_interrupted_status(self):
+        result = self.complete_history_run()["history_snapshot"]["results"][0]
+        result["status"] = "pending"
+
+        parsed = launcher_core.parse_history_result(result)
+
+        self.assertEqual(parsed.status_text, "执行中断")
+
+    def test_unknown_status_uses_original_value_or_unknown(self):
+        run = self.complete_history_run(status="custom")
+        self.assertEqual(launcher_core.parse_history_run(run).status_text, "custom")
+        run["status"] = ""
+        self.assertEqual(launcher_core.parse_history_run(run).status_text, "未知")
+
+    def test_load_apply_history_missing_file_is_empty_and_not_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(state, launcher_core.ApplyHistoryState(runs=()))
+            self.assertEqual(launcher_core.EMPTY_HISTORY_TEXT, "暂无执行历史")
+            self.assertFalse((root / "organizer_run_log.json").exists())
+
+    def test_load_apply_history_empty_runs_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_history_log(root, [])
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(state.runs, ())
+            self.assertEqual(state.error, "")
+
+    def test_load_apply_history_damaged_json_returns_path_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "organizer_run_log.json"
+            path.write_text("{bad json", encoding="utf-8")
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(state.runs, ())
+            self.assertIn("organizer_run_log.json 无法读取", state.error)
+            self.assertIn(str(path.resolve()), state.error)
+
+    def test_load_apply_history_requires_object_and_runs_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "organizer_run_log.json"
+            for payload in ([], {"runs": {}}):
+                with self.subTest(payload=payload):
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    state = launcher_core.load_apply_history(root)
+                    self.assertEqual(state.runs, ())
+                    self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_single_bad_result_discards_all_runs_with_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = self.complete_history_run(run_id="good")
+            bad = self.complete_history_run(run_id="bad")
+            bad["history_snapshot"]["results"][0]["orders"] = "not-an-int"
+            self.write_history_log(root, [good, bad])
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(state.runs, ())
+            self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_non_object_run_discards_all_runs_with_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_history_log(root, [self.complete_history_run(), []])
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(state.runs, ())
+            self.assertIn("organizer_run_log.json 无法读取", state.error)
+
+    def test_non_integral_numbers_are_invalid_history_counts(self):
+        result = self.complete_history_run()["history_snapshot"]["results"][0]
+        result["quantity"] = 2.5
+
+        with self.assertRaises(ValueError):
+            launcher_core.parse_history_result(result)
+
+    def test_unsupported_snapshot_schema_is_legacy(self):
+        run_data = self.complete_history_run()
+        run_data["history_snapshot"]["schema_version"] = 2
+
+        run = launcher_core.parse_history_run(run_data)
+
+        self.assertFalse(run.has_complete_details)
+        self.assertEqual(run.results, ())
+
+    def test_snapshot_results_must_be_list_when_schema_supported(self):
+        run_data = self.complete_history_run()
+        run_data["history_snapshot"]["results"] = {}
+
+        with self.assertRaises(ValueError):
+            launcher_core.parse_history_run(run_data)
+
+    def test_load_apply_history_filters_explicit_non_apply_and_keeps_missing_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_apply = self.complete_history_run(run_id="old-apply")
+            dry_run = self.complete_history_run(run_id="dry", mode="dry-run")
+            legacy_apply = self.complete_history_run(run_id="legacy-apply")
+            legacy_apply.pop("mode")
+            self.write_history_log(root, [old_apply, dry_run, legacy_apply])
+
+            state = launcher_core.load_apply_history(root)
+
+            self.assertEqual(
+                [run.run_id for run in state.runs],
+                ["legacy-apply", "old-apply"],
+            )
+
+    def test_source_items_and_matched_keywords_must_be_lists(self):
+        result = self.complete_history_run()["history_snapshot"]["results"][0]
+        for field in ("source_items", "matched_keywords"):
+            with self.subTest(field=field):
+                invalid = dict(result)
+                invalid[field] = ()
+                with self.assertRaises(ValueError):
+                    launcher_core.parse_history_result(invalid)
+
+    def test_history_parse_helpers_require_objects(self):
+        for helper in (
+            launcher_core.parse_history_source_item,
+            launcher_core.parse_history_result,
+            launcher_core.parse_history_run,
+        ):
+            with self.subTest(helper=helper.__name__):
+                with self.assertRaises(ValueError):
+                    helper([])
+
     def test_build_update_progress_text_for_known_total(self):
         progress = DownloadProgress(
             phase="downloading",

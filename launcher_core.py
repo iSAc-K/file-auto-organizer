@@ -40,6 +40,20 @@ PREVIEW_COLUMN_WIDTHS = {
 }
 PREVIEW_COLUMN_MAX_WIDTH = 600
 PREVIEW_COLUMN_PADDING = 24
+RUN_STATUS_TEXT = {
+    "success": "成功",
+    "partial": "部分成功",
+    "failed": "失败",
+    "running": "执行中断",
+}
+RESULT_STATUS_TEXT = {
+    "success": "成功",
+    "skipped": "跳过",
+    "failed": "失败",
+    "pending": "执行中断",
+}
+EMPTY_HISTORY_TEXT = "暂无执行历史"
+LEGACY_HISTORY_TEXT = "旧记录无完整详情"
 
 
 class OperationGate:
@@ -114,6 +128,47 @@ class UpdateProgressText:
     percent: str
     value: float
     indeterminate: bool
+
+
+@dataclass(frozen=True)
+class HistorySourceItem:
+    original_name: str
+    source_type: str
+    source_path: str
+
+
+@dataclass(frozen=True)
+class HistoryResult:
+    result_id: str
+    final_name: str
+    target_path: str
+    source_items: tuple[HistorySourceItem, ...]
+    merged: bool
+    date: str
+    category: str
+    orders: int
+    quantity: int
+    matched_keywords: tuple[str, ...]
+    status: str
+    status_text: str
+    error_reason: str
+
+
+@dataclass(frozen=True)
+class HistoryRun:
+    run_id: str
+    time: str
+    root: str
+    status: str
+    status_text: str
+    has_complete_details: bool
+    results: tuple[HistoryResult, ...]
+
+
+@dataclass(frozen=True)
+class ApplyHistoryState:
+    runs: tuple[HistoryRun, ...]
+    error: str = ""
 
 
 def app_base_dir() -> Path:
@@ -420,6 +475,123 @@ def undo_log_status(root_path: str | Path) -> tuple[bool, str]:
     if not isinstance(runs, list) or not runs:
         return False, "organizer_run_log.json 中没有可检查的运行记录。"
     return True, f"已找到 organizer_run_log.json，共 {len(runs)} 条运行记录。"
+
+
+def _history_object(value: object, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必须是对象。")
+    return value
+
+
+def _history_text(value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, (str, int, float, bool)):
+        raise ValueError("历史文本字段类型无效。")
+    return str(value)
+
+
+def _history_int(value: object, label: str) -> int:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(f"{label} 必须是整数。")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{label} 必须是整数。")
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} 必须是整数。") from exc
+
+
+def _history_status_text(status: str, mapping: dict[str, str]) -> str:
+    return mapping.get(status, status or "未知")
+
+
+def parse_history_source_item(value: object) -> HistorySourceItem:
+    item = _history_object(value, "source_item")
+    return HistorySourceItem(
+        original_name=_history_text(item.get("original_name")),
+        source_type=_history_text(item.get("source_type")),
+        source_path=_history_text(item.get("source_path")),
+    )
+
+
+def parse_history_result(value: object) -> HistoryResult:
+    result = _history_object(value, "result")
+    source_items = result.get("source_items")
+    if not isinstance(source_items, list):
+        raise ValueError("source_items 必须是列表。")
+    matched_keywords = result.get("matched_keywords")
+    if not isinstance(matched_keywords, list):
+        raise ValueError("matched_keywords 必须是列表。")
+    status = _history_text(result.get("status"))
+    return HistoryResult(
+        result_id=_history_text(result.get("result_id")),
+        final_name=_history_text(result.get("final_name")),
+        target_path=_history_text(result.get("target_path")),
+        source_items=tuple(parse_history_source_item(item) for item in source_items),
+        merged=bool(result.get("merged", False)),
+        date=_history_text(result.get("date")),
+        category=_history_text(result.get("category")),
+        orders=_history_int(result.get("orders"), "orders"),
+        quantity=_history_int(result.get("quantity"), "quantity"),
+        matched_keywords=tuple(
+            _history_text(keyword) for keyword in matched_keywords
+        ),
+        status=status,
+        status_text=_history_status_text(status, RESULT_STATUS_TEXT),
+        error_reason=_history_text(result.get("error_reason")),
+    )
+
+
+def parse_history_run(value: object) -> HistoryRun:
+    run = _history_object(value, "run")
+    status = _history_text(run.get("status"))
+    snapshot = run.get("history_snapshot")
+    has_complete_details = False
+    results: tuple[HistoryResult, ...] = ()
+    if isinstance(snapshot, dict) and snapshot.get("schema_version") == 1:
+        raw_results = snapshot.get("results")
+        if not isinstance(raw_results, list):
+            raise ValueError("history_snapshot.results 必须是列表。")
+        results = tuple(parse_history_result(result) for result in raw_results)
+        has_complete_details = True
+    return HistoryRun(
+        run_id=_history_text(run.get("run_id")),
+        time=_history_text(run.get("time")),
+        root=_history_text(run.get("root")),
+        status=status,
+        status_text=_history_status_text(status, RUN_STATUS_TEXT),
+        has_complete_details=has_complete_details,
+        results=results,
+    )
+
+
+def load_apply_history(root_path: str | Path) -> ApplyHistoryState:
+    run_log_path = Path(root_path).expanduser().resolve() / "organizer_run_log.json"
+    if not run_log_path.exists():
+        return ApplyHistoryState(runs=())
+    try:
+        with run_log_path.open("r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("organizer_run_log.json 顶层必须是对象。")
+        raw_runs = data.get("runs")
+        if not isinstance(raw_runs, list):
+            raise ValueError("organizer_run_log.json 中 runs 必须是列表。")
+        parsed_runs = []
+        for raw_run in reversed(raw_runs):
+            run = _history_object(raw_run, "run")
+            if run.get("mode", "apply") == "apply":
+                parsed_runs.append(parse_history_run(run))
+        runs = tuple(parsed_runs)
+        return ApplyHistoryState(runs=runs)
+    except Exception as exc:
+        return ApplyHistoryState(
+            runs=(),
+            error=f"organizer_run_log.json 无法读取：{run_log_path}：{exc}",
+        )
 
 
 def read_version(base_dir: str | Path | None = None) -> str:
