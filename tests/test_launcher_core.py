@@ -115,7 +115,7 @@ class LauncherCoreTests(unittest.TestCase):
         self.assertEqual(run.status_text, "执行中断")
         self.assertFalse(run.has_complete_details)
         self.assertEqual(run.results, ())
-        self.assertEqual(launcher_core.LEGACY_HISTORY_TEXT, "旧记录无完整详情")
+        self.assertEqual(launcher_core.LEGACY_HISTORY_TEXT, "旧版记录，详情不完整")
 
     def test_parse_pending_result_maps_interrupted_status(self):
         result = self.complete_history_run()["history_snapshot"]["results"][0]
@@ -138,7 +138,10 @@ class LauncherCoreTests(unittest.TestCase):
             state = launcher_core.load_apply_history(root)
 
             self.assertEqual(state, launcher_core.ApplyHistoryState(runs=()))
-            self.assertEqual(launcher_core.EMPTY_HISTORY_TEXT, "暂无执行历史")
+            self.assertEqual(
+                launcher_core.EMPTY_HISTORY_TEXT,
+                "暂无执行历史，完成一次执行整理后会显示在这里",
+            )
             self.assertFalse((root / "organizer_run_log.json").exists())
 
     def test_load_apply_history_empty_runs_returns_empty(self):
@@ -212,6 +215,17 @@ class LauncherCoreTests(unittest.TestCase):
 
         self.assertFalse(run.has_complete_details)
         self.assertEqual(run.results, ())
+
+    def test_non_exact_integer_snapshot_schema_is_legacy(self):
+        for schema_version in (True, 1.0, "1"):
+            with self.subTest(schema_version=schema_version):
+                run_data = self.complete_history_run()
+                run_data["history_snapshot"]["schema_version"] = schema_version
+
+                run = launcher_core.parse_history_run(run_data)
+
+                self.assertFalse(run.has_complete_details)
+                self.assertEqual(run.results, ())
 
     def test_snapshot_results_must_be_list_when_schema_supported(self):
         run_data = self.complete_history_run()

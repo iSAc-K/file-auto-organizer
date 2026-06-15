@@ -52,8 +52,8 @@ RESULT_STATUS_TEXT = {
     "failed": "失败",
     "pending": "执行中断",
 }
-EMPTY_HISTORY_TEXT = "暂无执行历史"
-LEGACY_HISTORY_TEXT = "旧记录无完整详情"
+EMPTY_HISTORY_TEXT = "暂无执行历史，完成一次执行整理后会显示在这里"
+LEGACY_HISTORY_TEXT = "旧版记录，详情不完整"
 
 
 class OperationGate:
@@ -551,7 +551,8 @@ def parse_history_run(value: object) -> HistoryRun:
     snapshot = run.get("history_snapshot")
     has_complete_details = False
     results: tuple[HistoryResult, ...] = ()
-    if isinstance(snapshot, dict) and snapshot.get("schema_version") == 1:
+    schema_version = snapshot.get("schema_version") if isinstance(snapshot, dict) else None
+    if type(schema_version) is int and schema_version == 1:
         raw_results = snapshot.get("results")
         if not isinstance(raw_results, list):
             raise ValueError("history_snapshot.results 必须是列表。")
