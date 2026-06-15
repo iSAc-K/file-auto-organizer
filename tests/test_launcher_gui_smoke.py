@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import threading
 import unittest
 from queue import Empty
@@ -9,7 +10,13 @@ from unittest.mock import patch
 
 import customtkinter as ctk
 
-from launcher_core import ApplyHistoryState, EMPTY_HISTORY_TEXT, HistoryRun
+from launcher_core import (
+    ApplyHistoryState,
+    EMPTY_HISTORY_TEXT,
+    HistoryRun,
+    SETTINGS_NAME,
+    app_base_dir,
+)
 from launcher_gui import LauncherGui
 from update_manager import DownloadProgress, UpdateCancelled
 
@@ -19,10 +26,14 @@ class LauncherGuiSmokeTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        cls.settings_temp_dir = tempfile.TemporaryDirectory()
+        cls.app_settings_path = app_base_dir() / SETTINGS_NAME
+        cls.app_settings_snapshot = cls._read_settings_snapshot(cls.app_settings_path)
         cls.root = ctk.CTk()
         cls.root.withdraw()
         with patch.object(LauncherGui, "check_for_updates_async"):
             cls.gui = LauncherGui(cls.root)
+        cls.gui.settings_path = Path(cls.settings_temp_dir.name) / SETTINGS_NAME
         cls.root.after(0, lambda: cls.root.after(10, cls.root.quit))
         cls.root.mainloop()
 
@@ -31,8 +42,23 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         if cls.root.winfo_exists():
             cls.root.after(300, cls.root.destroy)
             cls.root.mainloop()
+        cls.settings_temp_dir.cleanup()
+
+    @staticmethod
+    def _read_settings_snapshot(path: Path) -> tuple[bool, bytes]:
+        return path.exists(), path.read_bytes() if path.exists() else b""
 
     def setUp(self) -> None:
+        self.saved_gui_state = {
+            "python_command": self.gui.python_command.get(),
+            "script_path": self.gui.script_path.get(),
+            "root_path": self.gui.root_path.get(),
+            "config_path": self.gui.config_path.get(),
+            "run_mode": self.gui.run_mode.get(),
+            "use_archive": bool(self.gui.use_archive.get()),
+            "open_result_folder": bool(self.gui.open_result_folder.get()),
+            "active_page": self.gui.active_page,
+        }
         self.info = SimpleNamespace(version="9.9.9", notes=["测试更新"])
         self.gui.app_closing = False
         self.gui._ensure_ui_poll()
@@ -40,7 +66,22 @@ class LauncherGuiSmokeTests(unittest.TestCase):
     def tearDown(self) -> None:
         def cleanup() -> None:
             self.gui.config_dirty = False
-            self.gui.show_task_page("dry-run")
+            self.gui.python_command.set(self.saved_gui_state["python_command"])
+            self.gui.script_path.set(self.saved_gui_state["script_path"])
+            self.gui.root_path.set(self.saved_gui_state["root_path"])
+            self.gui.config_path.set(self.saved_gui_state["config_path"])
+            self.gui.use_archive.set(self.saved_gui_state["use_archive"])
+            self.gui.open_result_folder.set(self.saved_gui_state["open_result_folder"])
+            if self.saved_gui_state["active_page"] == "config":
+                self.gui.show_config_page()
+            elif self.saved_gui_state["active_page"] == "history":
+                with patch(
+                    "launcher_gui.load_apply_history",
+                    return_value=self.gui.history_state,
+                ):
+                    self.gui.show_history_page()
+            else:
+                self.gui.show_task_page(self.saved_gui_state["run_mode"])
             self.gui._set_update_status("latest")
             if self.gui.update_overlay is not None:
                 self.gui._release_update_lock()
@@ -102,6 +143,36 @@ class LauncherGuiSmokeTests(unittest.TestCase):
     def open_window(self) -> None:
         with patch.object(self.gui, "start_manual_update_check"):
             self.run_action(self.gui.open_update_window)
+
+    def assert_app_settings_unchanged(self) -> None:
+        self.assertEqual(
+            self._read_settings_snapshot(self.app_settings_path),
+            self.app_settings_snapshot,
+        )
+
+    def test_history_navigation_does_not_write_app_base_settings(self):
+        self.gui.root_path.set("C:/history-root")
+
+        with patch(
+            "launcher_gui.load_apply_history",
+            return_value=ApplyHistoryState(runs=()),
+        ):
+            self.run_action(self.gui.show_history_page)
+            self.run_action(lambda: self.gui.show_task_page("dry-run"))
+
+        self.assert_app_settings_unchanged()
+        self.assertTrue(
+            self.gui.settings_path.is_relative_to(Path(self.settings_temp_dir.name))
+        )
+        self.assertTrue(self.gui.settings_path.exists())
+
+    def test_navigation_color_helper_sets_only_requested_page_active(self):
+        self.gui._set_navigation_colors("history")
+
+        self.assertEqual(self.gui.history_nav_button.cget("fg_color"), "#F05A28")
+        self.assertEqual(self.gui.config_nav_button.cget("fg_color"), "#1B2630")
+        for button in self.gui.mode_buttons.values():
+            self.assertEqual(button.cget("fg_color"), "#1B2630")
 
     def test_history_page_starts_hidden_and_entering_without_root_shows_empty_state(self):
         self.gui.root_path.set("")

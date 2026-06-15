@@ -435,6 +435,31 @@ class LauncherGui:
         button.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 10))
         self.mode_buttons[value] = button
 
+    def _set_navigation_colors(self, active_page: str) -> None:
+        active_mode = self.run_mode.get() if active_page == "tasks" else ""
+        for value, button in self.mode_buttons.items():
+            if value == active_mode:
+                button.configure(
+                    fg_color="#F05A28",
+                    hover_color="#C84418",
+                    text_color="#FFFFFF",
+                )
+            else:
+                button.configure(
+                    fg_color="#1B2630",
+                    hover_color="#24313C",
+                    text_color="#DCE6EE",
+                )
+
+        self.config_nav_button.configure(
+            fg_color="#F05A28" if active_page == "config" else "#1B2630",
+            text_color="#FFFFFF" if active_page == "config" else "#DCE6EE",
+        )
+        self.history_nav_button.configure(
+            fg_color="#F05A28" if active_page == "history" else "#1B2630",
+            text_color="#FFFFFF" if active_page == "history" else "#DCE6EE",
+        )
+
     def show_task_page(self, mode: str) -> None:
         if self.active_page == "config" and not self.confirm_discard_config_changes():
             return
@@ -444,9 +469,8 @@ class LauncherGui:
         self.task_center.grid()
         self.task_right.grid()
         self.action_bar.grid()
-        self.config_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
-        self.history_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
         self.run_mode.set(mode)
+        self._set_navigation_colors("tasks")
 
     def show_config_page(self) -> None:
         if self.active_page == "config":
@@ -457,10 +481,7 @@ class LauncherGui:
         self.action_bar.grid_remove()
         self.history_page.grid_remove()
         self.config_page.grid()
-        self.config_nav_button.configure(fg_color="#F05A28", text_color="#FFFFFF")
-        self.history_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
-        for button in self.mode_buttons.values():
-            button.configure(fg_color="#1B2630", text_color="#DCE6EE")
+        self._set_navigation_colors("config")
         self.load_config_editor()
 
     def show_history_page(self) -> None:
@@ -472,10 +493,7 @@ class LauncherGui:
         self.action_bar.grid_remove()
         self.config_page.grid_remove()
         self.history_page.grid()
-        self.config_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
-        self.history_nav_button.configure(fg_color="#F05A28", text_color="#FFFFFF")
-        for button in self.mode_buttons.values():
-            button.configure(fg_color="#1B2630", text_color="#DCE6EE")
+        self._set_navigation_colors("history")
         self.reload_history_page()
 
     def reload_history_page(self) -> None:
@@ -1976,11 +1994,7 @@ class LauncherGui:
 
     def on_mode_changed(self, *_args: object) -> None:
         mode = self.run_mode.get()
-        for value, button in self.mode_buttons.items():
-            if value == mode:
-                button.configure(fg_color="#F05A28", hover_color="#C84418", text_color="#FFFFFF")
-            else:
-                button.configure(fg_color="#1B2630", hover_color="#24313C", text_color="#DCE6EE")
+        self._set_navigation_colors(self.active_page)
 
         if mode == "apply":
             self.mode_badge.configure(text="Apply", fg_color="#FFE7D8", text_color="#9B3417")
