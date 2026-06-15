@@ -35,6 +35,8 @@ except ImportError:  # PyYAML is recommended, but the default config has a fallb
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 RUN_LOG_NAME = "organizer_run_log.json"
 RUN_LOG_TMP_NAME = "organizer_run_log.json.tmp"
+HISTORY_SCHEMA_VERSION = 1
+MAX_APPLY_RUNS = 100
 REPORT_NAME = "整理报告.xlsx"
 UNDOABLE_RUN_STATUSES = {"success", "partial"}
 WINDOWS_ILLEGAL_CHARS = r'\/:*?"<>|'
@@ -565,6 +567,46 @@ def safe_write_run_log(run_log_path: Path, data: Dict[str, Any]) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.replace(tmp_path, run_log_path)
+
+
+def history_result_id(index: int) -> str:
+    return f"result-{index + 1}"
+
+
+def build_history_source_item(item: WorkItem) -> Dict[str, Any]:
+    source_path = item.archive_path if item.source_type == "archive" and item.archive_path else item.current_path
+    return {
+        "source_name": item.original_name,
+        "source_path": absolute_text(source_path),
+        "source_type": item.source_type,
+    }
+
+
+def build_history_snapshot(groups: List[PlanGroup]) -> Dict[str, Any]:
+    results = []
+    for index, group in enumerate(groups):
+        matched_keywords = []
+        for item in group.items:
+            keyword = item.detection.matched_keyword
+            if keyword and keyword not in matched_keywords:
+                matched_keywords.append(keyword)
+        results.append(
+            {
+                "result_id": history_result_id(index),
+                "final_name": group.final_name,
+                "target_path": absolute_text(group.target_path),
+                "source_items": [build_history_source_item(item) for item in group.items],
+                "merged": group.is_merge and len(group.items) > 1,
+                "date": group.date_label,
+                "category": group.category,
+                "orders": group.orders,
+                "quantity": group.quantity,
+                "matched_keywords": matched_keywords,
+                "status": "pending",
+                "error_reason": "",
+            }
+        )
+    return {"schema_version": HISTORY_SCHEMA_VERSION, "results": results}
 
 
 def create_apply_run(root: Path, run_log_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]]:

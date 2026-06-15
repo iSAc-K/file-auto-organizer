@@ -12,6 +12,7 @@ from file_helper import (
     REPORT_NAME,
     RUN_LOG_NAME,
     apply_plan,
+    build_history_snapshot,
     build_plan,
     check_config_diagnostics,
     compress_groups,
@@ -92,6 +93,48 @@ def write_config(path: Path, body: str) -> Path:
 
 
 class FileHelperCoreTests(unittest.TestCase):
+    def test_build_history_snapshot_aggregates_final_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mkdir(root / "0501 军牌钥匙扣 1单2个")
+            mkdir(root / "0505 军牌钥匙扣 2单3个")
+
+            _items, groups = build_plan(root, test_config(), "apply", root / "rename_log.csv")
+            snapshot = build_history_snapshot(groups)
+
+        self.assertEqual(snapshot["schema_version"], 1)
+        self.assertEqual(len(snapshot["results"]), 1)
+        result = snapshot["results"][0]
+        group = groups[0]
+        self.assertEqual(result["final_name"], group.final_name)
+        self.assertEqual(result["target_path"], str(group.target_path.resolve()))
+        self.assertEqual(result["date"], "0501-0505")
+        self.assertEqual(result["category"], "军牌钥匙扣")
+        self.assertEqual(result["orders"], 3)
+        self.assertEqual(result["quantity"], 5)
+        self.assertEqual(result["matched_keywords"], ["军牌钥匙扣"])
+        self.assertTrue(result["merged"])
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["error_reason"], "")
+        self.assertEqual(
+            [item["source_name"] for item in result["source_items"]],
+            ["0501 军牌钥匙扣 1单2个", "0505 军牌钥匙扣 2单3个"],
+        )
+
+    def test_build_history_snapshot_marks_single_group_not_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mkdir(root / "0507 军牌项链 1单2个")
+
+            _items, groups = build_plan(root, test_config(), "apply", root / "rename_log.csv")
+            snapshot = build_history_snapshot(groups)
+
+        result = snapshot["results"][0]
+        self.assertFalse(result["merged"])
+        self.assertEqual(result["orders"], 1)
+        self.assertEqual(result["quantity"], 2)
+        self.assertEqual(result["source_items"][0]["source_type"], "folder")
+
     def test_generated_merge_folder_requires_explicit_merge_sequence_separator(self):
         cases = {
             "06-03-HYX-NP图片项链-6单-13个": False,
