@@ -32,8 +32,11 @@ from update_manager import (
     is_newer_version,
 )
 from launcher_core import (
+    EMPTY_HISTORY_TEXT,
     PREVIEW_COLUMN_WIDTHS,
     SETTINGS_NAME,
+    ApplyHistoryState,
+    HistoryRun,
     LauncherSettings,
     OperationGate,
     app_base_dir,
@@ -47,6 +50,7 @@ from launcher_core import (
     default_window_geometry,
     default_settings,
     find_latest_report,
+    load_apply_history,
     load_settings as core_load_settings,
     preview_expanded_width,
     read_version,
@@ -103,6 +107,8 @@ class LauncherGui:
         self.scroll_window_id: int | None = None
         self.main_scroll_active = False
         self.active_page = "tasks"
+        self.history_state = ApplyHistoryState(runs=())
+        self.history_runs_by_item: dict[str, HistoryRun] = {}
         self.config_dirty = False
         self.config_entries: dict[str, dict[str, object]] = {}
         self.config_order: list[str] = []
@@ -216,7 +222,7 @@ class LauncherGui:
         sidebar = ctk.CTkFrame(body, fg_color="#101820", corner_radius=0, width=238)
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
-        sidebar.grid_rowconfigure(6, weight=1)
+        sidebar.grid_rowconfigure(7, weight=1)
 
         ctk.CTkLabel(
             sidebar,
@@ -248,6 +254,19 @@ class LauncherGui:
             font=ctk.CTkFont(size=13, weight="bold"),
         )
         self.config_nav_button.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 10))
+        self.history_nav_button = ctk.CTkButton(
+            sidebar,
+            text="执行历史\n查看实际整理结果",
+            command=self.show_history_page,
+            anchor="w",
+            height=58,
+            fg_color="#1B2630",
+            hover_color="#24313C",
+            text_color="#DCE6EE",
+            corner_radius=8,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.history_nav_button.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 10))
 
         self.safety_status = ctk.CTkLabel(
             sidebar,
@@ -258,7 +277,7 @@ class LauncherGui:
             wraplength=190,
             justify="left",
         )
-        self.safety_status.grid(row=6, column=0, sticky="sew", padx=22, pady=(0, 26))
+        self.safety_status.grid(row=7, column=0, sticky="sew", padx=22, pady=(0, 26))
         self.update_nav_button = ctk.CTkButton(
             sidebar,
             text="检查更新\n查看版本与更新状态",
@@ -271,7 +290,7 @@ class LauncherGui:
             corner_radius=8,
             font=ctk.CTkFont(size=13, weight="bold"),
         )
-        self.update_nav_button.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 18))
+        self.update_nav_button.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 18))
 
         center_shell = ctk.CTkFrame(body, fg_color="#EEF2F4", corner_radius=0)
         self.task_center = center_shell
@@ -362,6 +381,7 @@ class LauncherGui:
 
         self._build_action_bar(self.root)
         self._build_config_page(body)
+        self._build_history_page(body)
 
     def _build_header(self, parent: ctk.CTkFrame) -> None:
         header = ctk.CTkFrame(parent, fg_color="transparent")
@@ -420,10 +440,12 @@ class LauncherGui:
             return
         self.active_page = "tasks"
         self.config_page.grid_remove()
+        self.history_page.grid_remove()
         self.task_center.grid()
         self.task_right.grid()
         self.action_bar.grid()
         self.config_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
+        self.history_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
         self.run_mode.set(mode)
 
     def show_config_page(self) -> None:
@@ -433,11 +455,123 @@ class LauncherGui:
         self.task_center.grid_remove()
         self.task_right.grid_remove()
         self.action_bar.grid_remove()
+        self.history_page.grid_remove()
         self.config_page.grid()
         self.config_nav_button.configure(fg_color="#F05A28", text_color="#FFFFFF")
+        self.history_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
         for button in self.mode_buttons.values():
             button.configure(fg_color="#1B2630", text_color="#DCE6EE")
         self.load_config_editor()
+
+    def show_history_page(self) -> None:
+        if self.active_page == "config" and not self.confirm_discard_config_changes():
+            return
+        self.active_page = "history"
+        self.task_center.grid_remove()
+        self.task_right.grid_remove()
+        self.action_bar.grid_remove()
+        self.config_page.grid_remove()
+        self.history_page.grid()
+        self.config_nav_button.configure(fg_color="#1B2630", text_color="#DCE6EE")
+        self.history_nav_button.configure(fg_color="#F05A28", text_color="#FFFFFF")
+        for button in self.mode_buttons.values():
+            button.configure(fg_color="#1B2630", text_color="#DCE6EE")
+        self.reload_history_page()
+
+    def reload_history_page(self) -> None:
+        root_path = clean_path_value(self.root_path.get())
+        if root_path:
+            state = load_apply_history(root_path)
+        else:
+            state = ApplyHistoryState(runs=())
+        self.render_history_state(state)
+
+    def render_history_state(self, state: ApplyHistoryState) -> None:
+        self.history_state = state
+        self.history_runs_by_item.clear()
+        for item in self.history_list.get_children():
+            self.history_list.delete(item)
+        self.history_list.selection_remove(self.history_list.selection())
+
+        if state.error:
+            self.history_detail_message.configure(text=state.error)
+            return
+        if not state.runs:
+            self.history_detail_message.configure(text=EMPTY_HISTORY_TEXT)
+            return
+
+        for run in state.runs:
+            item = self.history_list.insert(
+                "",
+                "end",
+                values=(run.time, run.root, run.status_text),
+            )
+            self.history_runs_by_item[item] = run
+        self.history_detail_message.configure(text="请选择一条执行记录")
+
+    def _build_history_page(self, parent: ctk.CTkFrame) -> None:
+        page = ctk.CTkFrame(parent, fg_color="#EEF2F4", corner_radius=0)
+        self.history_page = page
+        page.grid(row=0, column=1, columnspan=2, sticky="nsew", padx=(26, 24), pady=(22, 16))
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=1)
+        page.grid_remove()
+
+        ctk.CTkLabel(
+            page,
+            text="执行历史",
+            text_color="#101820",
+            font=ctk.CTkFont(size=28, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 14))
+
+        content = ctk.CTkFrame(page, fg_color="transparent")
+        content.grid(row=1, column=0, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+
+        list_card = ctk.CTkFrame(
+            content,
+            fg_color="#FFFFFF",
+            border_width=1,
+            border_color="#D6DEE5",
+        )
+        list_card.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        list_card.grid_columnconfigure(0, weight=1)
+        list_card.grid_rowconfigure(0, weight=1)
+
+        self.history_list = ttk.Treeview(
+            list_card,
+            columns=("time", "root", "status"),
+            show="headings",
+            selectmode="browse",
+        )
+        self.history_list.heading("time", text="时间")
+        self.history_list.heading("root", text="根目录")
+        self.history_list.heading("status", text="状态")
+        self.history_list.column("time", width=150, minwidth=120, stretch=False)
+        self.history_list.column("root", width=280, minwidth=160, stretch=True)
+        self.history_list.column("status", width=90, minwidth=70, stretch=False)
+        self.history_list.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+
+        detail_card = ctk.CTkFrame(
+            content,
+            fg_color="#FFFFFF",
+            border_width=1,
+            border_color="#D6DEE5",
+        )
+        detail_card.grid(row=0, column=1, sticky="nsew")
+        detail_card.grid_columnconfigure(0, weight=1)
+        detail_card.grid_rowconfigure(0, weight=1)
+        self.history_detail_message = ctk.CTkLabel(
+            detail_card,
+            text=EMPTY_HISTORY_TEXT,
+            text_color="#5E6B75",
+            justify="left",
+            anchor="nw",
+            wraplength=430,
+        )
+        self.history_detail_message.grid(row=0, column=0, sticky="nsew", padx=22, pady=22)
 
     def _build_config_page(self, parent: ctk.CTkFrame) -> None:
         page = ctk.CTkFrame(parent, fg_color="#EEF2F4", corner_radius=0)

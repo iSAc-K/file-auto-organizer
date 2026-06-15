@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import customtkinter as ctk
 
+from launcher_core import ApplyHistoryState, EMPTY_HISTORY_TEXT, HistoryRun
 from launcher_gui import LauncherGui
 from update_manager import DownloadProgress, UpdateCancelled
 
@@ -38,6 +39,8 @@ class LauncherGuiSmokeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         def cleanup() -> None:
+            self.gui.config_dirty = False
+            self.gui.show_task_page("dry-run")
             self.gui._set_update_status("latest")
             if self.gui.update_overlay is not None:
                 self.gui._release_update_lock()
@@ -99,6 +102,143 @@ class LauncherGuiSmokeTests(unittest.TestCase):
     def open_window(self) -> None:
         with patch.object(self.gui, "start_manual_update_check"):
             self.run_action(self.gui.open_update_window)
+
+    def test_history_page_starts_hidden_and_entering_without_root_shows_empty_state(self):
+        self.gui.root_path.set("")
+        self.assertEqual(self.gui.history_page.winfo_manager(), "")
+
+        with patch("launcher_gui.load_apply_history") as loader:
+            self.run_action(self.gui.show_history_page)
+
+        loader.assert_not_called()
+        self.assertEqual(self.gui.active_page, "history")
+        self.assertEqual(self.gui.history_page.winfo_manager(), "grid")
+        self.assertEqual(self.gui.task_center.winfo_manager(), "")
+        self.assertEqual(self.gui.history_detail_message.cget("text"), EMPTY_HISTORY_TEXT)
+
+    def test_history_page_reloads_every_time_it_is_entered(self):
+        self.gui.root_path.set("C:/history-root")
+
+        with patch(
+            "launcher_gui.load_apply_history",
+            return_value=ApplyHistoryState(runs=()),
+        ) as loader:
+            self.run_action(self.gui.show_history_page)
+            self.run_action(lambda: self.gui.show_task_page("dry-run"))
+            self.run_action(self.gui.show_history_page)
+
+        self.assertEqual(loader.call_count, 2)
+        self.assertEqual(
+            [args.args for args in loader.call_args_list],
+            [("C:/history-root",), ("C:/history-root",)],
+        )
+
+    def test_history_empty_state_uses_exact_message(self):
+        self.gui.root_path.set("C:/history-root")
+
+        with patch(
+            "launcher_gui.load_apply_history",
+            return_value=ApplyHistoryState(runs=()),
+        ):
+            self.run_action(self.gui.show_history_page)
+
+        self.assertEqual(self.gui.history_detail_message.cget("text"), EMPTY_HISTORY_TEXT)
+        self.assertEqual(self.gui.history_list.get_children(), ())
+
+    def test_history_error_state_shows_complete_error(self):
+        self.gui.root_path.set("C:/history-root")
+        error = "organizer_run_log.json 无法读取：C:/history-root/organizer_run_log.json：bad json"
+
+        with patch(
+            "launcher_gui.load_apply_history",
+            return_value=ApplyHistoryState(runs=(), error=error),
+        ):
+            self.run_action(self.gui.show_history_page)
+
+        self.assertEqual(self.gui.history_detail_message.cget("text"), error)
+
+    def test_history_runs_show_summary_without_default_selection(self):
+        self.gui.root_path.set("C:/history-root")
+        run = HistoryRun(
+            run_id="run-1",
+            time="2026-06-15 10:30:00",
+            root="C:/history-root",
+            status="success",
+            status_text="成功",
+            has_complete_details=True,
+            results=(),
+        )
+
+        with patch(
+            "launcher_gui.load_apply_history",
+            return_value=ApplyHistoryState(runs=(run,)),
+        ):
+            self.run_action(self.gui.show_history_page)
+
+        items = self.gui.history_list.get_children()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(
+            self.gui.history_list.item(items[0], "values"),
+            ("2026-06-15 10:30:00", "C:/history-root", "成功"),
+        )
+        self.assertEqual(self.gui.history_list.selection(), ())
+        self.assertIs(self.gui.history_runs_by_item[items[0]], run)
+        self.assertEqual(self.gui.history_detail_message.cget("text"), "请选择一条执行记录")
+
+    def test_cancelled_config_discard_does_not_enter_history(self):
+        self.run_action(self.gui.show_config_page)
+        self.gui.config_dirty = True
+
+        with (
+            patch.object(self.gui, "confirm_discard_config_changes", return_value=False),
+            patch("launcher_gui.load_apply_history") as loader,
+        ):
+            self.run_action(self.gui.show_history_page)
+
+        loader.assert_not_called()
+        self.assertEqual(self.gui.active_page, "config")
+        self.assertEqual(self.gui.config_page.winfo_manager(), "grid")
+        self.assertEqual(self.gui.history_page.winfo_manager(), "")
+
+    def test_task_and_config_pages_hide_history(self):
+        with patch(
+            "launcher_gui.load_apply_history",
+            return_value=ApplyHistoryState(runs=()),
+        ):
+            self.run_action(self.gui.show_history_page)
+        self.run_action(lambda: self.gui.show_task_page("apply"))
+        self.assertEqual(self.gui.history_page.winfo_manager(), "")
+        self.assertEqual(self.gui.task_center.winfo_manager(), "grid")
+
+        with patch(
+            "launcher_gui.load_apply_history",
+            return_value=ApplyHistoryState(runs=()),
+        ):
+            self.run_action(self.gui.show_history_page)
+        self.run_action(self.gui.show_config_page)
+        self.assertEqual(self.gui.history_page.winfo_manager(), "")
+        self.assertEqual(self.gui.config_page.winfo_manager(), "grid")
+
+    def test_history_navigation_colors_are_mutually_exclusive(self):
+        with patch(
+            "launcher_gui.load_apply_history",
+            return_value=ApplyHistoryState(runs=()),
+        ):
+            self.run_action(self.gui.show_history_page)
+
+        self.assertEqual(self.gui.history_nav_button.cget("fg_color"), "#F05A28")
+        self.assertEqual(self.gui.config_nav_button.cget("fg_color"), "#1B2630")
+        for button in self.gui.mode_buttons.values():
+            self.assertEqual(button.cget("fg_color"), "#1B2630")
+
+        self.run_action(self.gui.show_config_page)
+        self.assertEqual(self.gui.config_nav_button.cget("fg_color"), "#F05A28")
+        self.assertEqual(self.gui.history_nav_button.cget("fg_color"), "#1B2630")
+
+        self.run_action(lambda: self.gui.show_task_page("undo-last"))
+        self.assertEqual(self.gui.history_nav_button.cget("fg_color"), "#1B2630")
+        self.assertEqual(self.gui.config_nav_button.cget("fg_color"), "#1B2630")
+        self.assertEqual(self.gui.mode_buttons["undo-last"].cget("fg_color"), "#F05A28")
 
     def test_update_window_is_single_instance(self):
         self.open_window()
