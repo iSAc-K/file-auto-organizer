@@ -336,6 +336,41 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         self.assertIs(self.gui.manual_update_info, latest_info)
         self.assertEqual(self.gui.update_status, "available")
 
+    def test_newer_auto_check_clears_superseded_manual_check_latch(self):
+        self.open_window()
+        manual_started = threading.Event()
+        release_manual = threading.Event()
+        auto_started = threading.Event()
+        release_auto = threading.Event()
+        latest_info = SimpleNamespace(version=self.gui.version, notes=[])
+        stale_manual_info = SimpleNamespace(version="9.9.9", notes=["stale manual"])
+
+        def fetch():
+            if not manual_started.is_set():
+                manual_started.set()
+                if not release_manual.wait(2.0):
+                    raise TimeoutError("manual check was not released")
+                return stale_manual_info
+            auto_started.set()
+            if not release_auto.wait(2.0):
+                raise TimeoutError("auto check was not released")
+            return latest_info
+
+        with patch("launcher_gui.fetch_update_info_with_retry", side_effect=fetch):
+            self.run_action(self.gui.start_manual_update_check)
+            self.assertTrue(manual_started.wait(2.0))
+            self.run_action(self.gui.check_for_updates_async)
+            self.assertTrue(auto_started.wait(2.0))
+            release_manual.set()
+            self.run_until(lambda: not self.gui.manual_update_check_running)
+            self.assertEqual(self.gui.update_status, "checking")
+            release_auto.set()
+            self.run_until(lambda: self.gui.update_status == "latest")
+
+        self.assertFalse(self.gui.manual_update_check_running)
+        self.assertIsNone(self.gui.manual_update_info)
+        self.assertEqual(self.gui.update_status, "latest")
+
     def test_failed_latest_check_clears_stale_download_info(self):
         self.open_window()
         token = self.gui._next_update_check_generation()
@@ -396,6 +431,17 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         self.assertIsNone(self.gui.ui_poll_after_id)
         self.gui.app_closing = False
         self.gui._ensure_ui_poll()
+
+    def test_ui_poll_uses_approved_250ms_interval(self):
+        if self.gui.ui_poll_after_id is not None:
+            self.root.after_cancel(self.gui.ui_poll_after_id)
+            self.gui.ui_poll_after_id = None
+
+        with patch.object(self.root, "after", return_value="poll-id") as after:
+            self.gui._ensure_ui_poll()
+
+        after.assert_called_once_with(250, self.gui._poll_ui_events)
+        self.gui.ui_poll_after_id = None
 
 
 if __name__ == "__main__":

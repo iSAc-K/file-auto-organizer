@@ -58,7 +58,7 @@ from launcher_core import (
 )
 
 
-APP_TITLE = "Windows 文件整理助手 v2.4.4"
+APP_TITLE = "Windows 文件整理助手 v2.4.5"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 UPDATE_CHECK_LOG = "update_check.log"
 
@@ -81,7 +81,7 @@ class LauncherGui:
         self.base_dir = app_base_dir()
         self.settings_path = self.base_dir / SETTINGS_NAME
         self.defaults = default_settings(self.base_dir)
-        self.version = read_version(self.base_dir) or "2.4.4"
+        self.version = read_version(self.base_dir) or "2.4.5"
         settings = self.load_settings()
         self._initializing = True
 
@@ -131,6 +131,7 @@ class LauncherGui:
         self.update_overlay: ctk.CTkFrame | None = None
         self.manual_update_info: object | None = None
         self.manual_update_check_running = False
+        self.manual_update_check_token: int | None = None
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -974,6 +975,7 @@ class LauncherGui:
         self.update_stage_labels = []
         self.manual_update_info = None
         self.manual_update_check_running = False
+        self.manual_update_check_token = None
         self._next_update_check_generation()
 
     def _update_window_is_open(self) -> bool:
@@ -1063,7 +1065,7 @@ class LauncherGui:
     def _ensure_ui_poll(self) -> None:
         if self.app_closing or self.ui_poll_after_id is not None:
             return
-        self.ui_poll_after_id = self.root.after(50, self._poll_ui_events)
+        self.ui_poll_after_id = self.root.after(250, self._poll_ui_events)
 
     def _poll_ui_events(self) -> None:
         scheduled_id = self.ui_poll_after_id
@@ -1153,6 +1155,7 @@ class LauncherGui:
         self.manual_update_info = None
         self._set_update_window_state("checking")
         token = self._next_update_check_generation()
+        self.manual_update_check_token = token
         threading.Thread(
             target=self._manual_update_check_worker,
             args=(token,),
@@ -1182,6 +1185,7 @@ class LauncherGui:
             )
 
     def _handle_check_success(self, token: int, info: object, manual: bool) -> None:
+        superseded_manual = self._complete_manual_check_request(token)
         if not self._check_result_is_current(token):
             return
         if manual and not self._update_window_is_open():
@@ -1190,8 +1194,14 @@ class LauncherGui:
             self._finish_manual_update_check(info)
         elif is_newer_version(str(getattr(info, "version")), self.version):
             self.offer_update(info)
+        elif (
+            self._update_window_is_open()
+            and (superseded_manual or self.update_status == "checking")
+        ):
+            self._finish_manual_update_check(info)
 
     def _handle_check_failure(self, token: int, message: str, manual: bool) -> None:
+        superseded_manual = self._complete_manual_check_request(token)
         if not self._check_result_is_current(token):
             return
         if manual and not self._update_window_is_open():
@@ -1199,6 +1209,20 @@ class LauncherGui:
         self.manual_update_info = None
         if manual:
             self._finish_manual_update_check_failure(message)
+        elif (
+            self._update_window_is_open()
+            and (superseded_manual or self.update_status == "checking")
+        ):
+            self._finish_manual_update_check_failure(message)
+
+    def _complete_manual_check_request(self, completed_token: int) -> bool:
+        with self.update_state_lock:
+            manual_token = self.manual_update_check_token
+            if manual_token is None or completed_token < manual_token:
+                return False
+            self.manual_update_check_token = None
+            self.manual_update_check_running = False
+            return True
 
     def _finish_manual_update_check(self, info: object) -> None:
         self.manual_update_check_running = False
@@ -1237,6 +1261,7 @@ class LauncherGui:
             return
         self._next_update_check_generation()
         self.manual_update_check_running = False
+        self.manual_update_check_token = None
         self.update_cancel_event = threading.Event()
         self._discard_ui_events()
         self.last_progress_phase = ""
