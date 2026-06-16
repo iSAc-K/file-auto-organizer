@@ -33,6 +33,7 @@ from update_manager import (
 )
 from launcher_core import (
     EMPTY_HISTORY_TEXT,
+    LEGACY_HISTORY_PARTIAL_TEXT,
     LEGACY_HISTORY_TEXT,
     PREVIEW_COLUMN_WIDTHS,
     SETTINGS_NAME,
@@ -40,6 +41,7 @@ from launcher_core import (
     HistoryResult,
     HistoryRun,
     HistorySourceItem,
+    LegacyHistoryOperation,
     LauncherSettings,
     OperationGate,
     app_base_dir,
@@ -65,7 +67,7 @@ from launcher_core import (
 )
 
 
-VERSION_FALLBACK = "2.5.1"
+VERSION_FALLBACK = "2.5.2"
 APP_TITLE = f"Windows 文件整理助手 v{VERSION_FALLBACK}"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 UPDATE_CHECK_LOG = "update_check.log"
@@ -570,6 +572,37 @@ class LauncherGui:
             "",
         )
 
+    @staticmethod
+    def _history_legacy_operation_values(operation: LegacyHistoryOperation) -> tuple[object, ...]:
+        target = operation.target_after or operation.source_before
+        return (
+            Path(target).name if target else "",
+            operation.target_after,
+            1 if operation.source_before else "",
+            "",
+            operation.action_text,
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+
+    @staticmethod
+    def _history_legacy_source_values(operation: LegacyHistoryOperation) -> tuple[str, ...]:
+        return (
+            "",
+            operation.source_before,
+            "",
+            "",
+            "",
+            "",
+            "旧版来源路径",
+            "",
+            "",
+            "",
+        )
+
     def on_history_run_selected(self, _event: object | None = None) -> None:
         selection = self.history_list.selection()
         if not selection:
@@ -580,7 +613,24 @@ class LauncherGui:
 
         self._clear_history_results()
         if not run.has_complete_details:
-            self.history_detail_message.configure(text=LEGACY_HISTORY_TEXT)
+            if not run.legacy_operations:
+                self.history_detail_message.configure(text=LEGACY_HISTORY_TEXT)
+                return
+            self.history_detail_message.configure(text=LEGACY_HISTORY_PARTIAL_TEXT)
+            for operation in run.legacy_operations:
+                parent = self.history_result_table.insert(
+                    "",
+                    "end",
+                    values=self._history_legacy_operation_values(operation),
+                    open=False,
+                )
+                if operation.source_before:
+                    self.history_result_table.insert(
+                        parent,
+                        "end",
+                        text="来源：旧版日志路径",
+                        values=self._history_legacy_source_values(operation),
+                    )
             return
 
         self.history_detail_message.configure(text="")

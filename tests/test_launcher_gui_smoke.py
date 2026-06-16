@@ -17,6 +17,8 @@ from launcher_core import (
     HistoryResult,
     HistoryRun,
     HistorySourceItem,
+    LegacyHistoryOperation,
+    LEGACY_HISTORY_PARTIAL_TEXT,
     LEGACY_HISTORY_TEXT,
     SETTINGS_NAME,
     app_base_dir,
@@ -54,8 +56,8 @@ class LauncherGuiSmokeTests(unittest.TestCase):
 
     def test_missing_version_file_uses_250_fallback_in_gui(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(launcher_gui.display_version(Path(tmp)), "2.5.1")
-            self.assertIn("v2.5.1", launcher_gui.APP_TITLE)
+            self.assertEqual(launcher_gui.display_version(Path(tmp)), "2.5.2")
+            self.assertIn("v2.5.2", launcher_gui.APP_TITLE)
 
     def setUp(self) -> None:
         self.saved_gui_state = {
@@ -196,6 +198,7 @@ class LauncherGuiSmokeTests(unittest.TestCase):
         *,
         complete: bool = True,
         results: tuple[HistoryResult, ...] = (),
+        legacy_operations: tuple[LegacyHistoryOperation, ...] = (),
     ) -> HistoryRun:
         return HistoryRun(
             run_id=run_id,
@@ -205,6 +208,7 @@ class LauncherGuiSmokeTests(unittest.TestCase):
             status_text="RUN_STATUS_FROM_CORE",
             has_complete_details=complete,
             results=results,
+            legacy_operations=legacy_operations,
         )
 
     def select_history_run(self, index: int = 0) -> None:
@@ -384,6 +388,37 @@ class LauncherGuiSmokeTests(unittest.TestCase):
 
         self.assertEqual(self.gui.history_detail_message.cget("text"), LEGACY_HISTORY_TEXT)
         self.assertEqual(self.gui.history_result_table.get_children(), ())
+
+    def test_legacy_history_run_with_operations_shows_partial_path_summary(self):
+        run = self.make_history_run(
+            complete=False,
+            legacy_operations=(
+                LegacyHistoryOperation(
+                    action="move",
+                    action_text="移动/重命名",
+                    source_before="C:/history-root/0615 mouse",
+                    target_after="C:/history-root/1-0615 mouse",
+                ),
+            ),
+        )
+        self.gui.render_history_state(ApplyHistoryState(runs=(run,)))
+
+        self.run_action(self.select_history_run)
+
+        self.assertEqual(self.gui.history_detail_message.cget("text"), LEGACY_HISTORY_PARTIAL_TEXT)
+        parents = self.gui.history_result_table.get_children()
+        self.assertEqual(len(parents), 1)
+        self.assertEqual(
+            self.gui.history_result_table.item(parents[0], "values"),
+            ("1-0615 mouse", "C:/history-root/1-0615 mouse", "1", "", "移动/重命名", "", "", "", "", ""),
+        )
+        children = self.gui.history_result_table.get_children(parents[0])
+        self.assertEqual(len(children), 1)
+        self.assertEqual(self.gui.history_result_table.item(children[0], "text"), "来源：旧版日志路径")
+        self.assertEqual(
+            self.gui.history_result_table.item(children[0], "values"),
+            ("", "C:/history-root/0615 mouse", "", "", "", "", "旧版来源路径", "", "", ""),
+        )
 
     def test_switching_history_runs_clears_old_rows_and_supports_multiple_results(self):
         first = self.make_history_run(

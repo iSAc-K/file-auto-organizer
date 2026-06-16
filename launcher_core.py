@@ -57,6 +57,12 @@ VALID_RUN_STATUSES = frozenset(RUN_STATUS_TEXT)
 VALID_RESULT_STATUSES = frozenset(RESULT_STATUS_TEXT)
 EMPTY_HISTORY_TEXT = "暂无执行历史，完成一次执行整理后会显示在这里"
 LEGACY_HISTORY_TEXT = "旧版记录，详情不完整"
+LEGACY_HISTORY_PARTIAL_TEXT = "旧版记录，详情不完整；以下仅显示日志里已记录的操作路径"
+LEGACY_OPERATION_TEXT = {
+    "move": "移动/重命名",
+    "create_dir": "创建目录",
+    "archive_create": "创建压缩包",
+}
 
 
 class OperationGate:
@@ -158,6 +164,14 @@ class HistoryResult:
 
 
 @dataclass(frozen=True)
+class LegacyHistoryOperation:
+    action: str
+    action_text: str
+    source_before: str
+    target_after: str
+
+
+@dataclass(frozen=True)
 class HistoryRun:
     run_id: str
     time: str
@@ -166,6 +180,7 @@ class HistoryRun:
     status_text: str
     has_complete_details: bool
     results: tuple[HistoryResult, ...]
+    legacy_operations: tuple[LegacyHistoryOperation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -555,6 +570,34 @@ def parse_history_result(value: object) -> HistoryResult:
     )
 
 
+def parse_legacy_history_operations(run: dict[str, object]) -> tuple[LegacyHistoryOperation, ...]:
+    raw_operations = run.get("operations", [])
+    if not isinstance(raw_operations, list):
+        return ()
+    operations: list[LegacyHistoryOperation] = []
+    for raw_operation in raw_operations:
+        if not isinstance(raw_operation, dict):
+            continue
+        action = raw_operation.get("action")
+        if type(action) is not str or not action:
+            continue
+        source_before = raw_operation.get("source_before")
+        target_after = raw_operation.get("target_after")
+        source_text = source_before if type(source_before) is str else ""
+        target_text = target_after if type(target_after) is str else ""
+        if not source_text and not target_text:
+            continue
+        operations.append(
+            LegacyHistoryOperation(
+                action=action,
+                action_text=LEGACY_OPERATION_TEXT.get(action, f"旧版操作：{action}"),
+                source_before=source_text,
+                target_after=target_text,
+            )
+        )
+    return tuple(operations)
+
+
 def parse_history_run(value: object) -> HistoryRun:
     run = _history_object(value, "run")
     _validate_history_run_fields(run)
@@ -571,6 +614,7 @@ def parse_history_run(value: object) -> HistoryRun:
             raise ValueError("history_snapshot.results 必须是列表。")
         results = tuple(parse_history_result(result) for result in raw_results)
         has_complete_details = True
+    legacy_operations = () if has_complete_details else parse_legacy_history_operations(run)
     return HistoryRun(
         run_id=_history_text(run, "run_id"),
         time=_history_text(run, "time"),
@@ -579,6 +623,7 @@ def parse_history_run(value: object) -> HistoryRun:
         status_text=_history_status_text(status, RUN_STATUS_TEXT),
         has_complete_details=has_complete_details,
         results=results,
+        legacy_operations=legacy_operations,
     )
 
 

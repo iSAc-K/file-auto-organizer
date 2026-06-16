@@ -115,7 +115,45 @@ class LauncherCoreTests(unittest.TestCase):
         self.assertEqual(run.status_text, "执行中断")
         self.assertFalse(run.has_complete_details)
         self.assertEqual(run.results, ())
+        self.assertEqual(run.legacy_operations, ())
         self.assertEqual(launcher_core.LEGACY_HISTORY_TEXT, "旧版记录，详情不完整")
+
+    def test_parse_legacy_run_keeps_recorded_operation_paths_only(self):
+        run = launcher_core.parse_history_run(
+            {
+                "run_id": "legacy",
+                "time": "2026-06-15 11:00:00",
+                "root": r"D:\orders",
+                "status": "success",
+                "operations": [
+                    {
+                        "action": "move",
+                        "source_before": r"D:\orders\0501 old",
+                        "target_after": r"D:\orders\1-0501 old",
+                    },
+                    {
+                        "action": "create_dir",
+                        "target_after": r"D:\orders\1~2-merged",
+                    },
+                    {"action": "move"},
+                    "bad",
+                ],
+            }
+        )
+
+        self.assertFalse(run.has_complete_details)
+        self.assertEqual(run.results, ())
+        self.assertEqual(len(run.legacy_operations), 2)
+        self.assertEqual(run.legacy_operations[0].action_text, "移动/重命名")
+        self.assertEqual(run.legacy_operations[0].source_before, r"D:\orders\0501 old")
+        self.assertEqual(run.legacy_operations[0].target_after, r"D:\orders\1-0501 old")
+        self.assertEqual(run.legacy_operations[1].action_text, "创建目录")
+        self.assertEqual(run.legacy_operations[1].source_before, "")
+        self.assertEqual(run.legacy_operations[1].target_after, r"D:\orders\1~2-merged")
+        self.assertEqual(
+            launcher_core.LEGACY_HISTORY_PARTIAL_TEXT,
+            "旧版记录，详情不完整；以下仅显示日志里已记录的操作路径",
+        )
 
     def test_parse_pending_result_maps_interrupted_status(self):
         result = self.complete_history_run()["history_snapshot"]["results"][0]
