@@ -65,7 +65,7 @@ from launcher_core import (
 )
 
 
-VERSION_FALLBACK = "2.5.0"
+VERSION_FALLBACK = "2.5.1"
 APP_TITLE = f"Windows 文件整理助手 v{VERSION_FALLBACK}"
 LAUNCHER_OUTPUT_LOG = "launcher_run_output.log"
 UPDATE_CHECK_LOG = "update_check.log"

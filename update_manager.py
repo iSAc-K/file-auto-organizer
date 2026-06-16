@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import ssl
 import tempfile
 import threading
 import time
@@ -15,6 +16,11 @@ from typing import Any, Callable, Literal
 UPDATE_MANIFEST_URL = (
     "https://github.com/iSAc-K/file-auto-organizer/releases/latest/download/update.json"
 )
+
+try:
+    import certifi
+except ImportError:  # pragma: no cover - fallback for source runs without certifi
+    certifi = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -82,6 +88,16 @@ def _content_length(response: Any) -> int | None:
     return total if total > 0 else None
 
 
+def _ssl_context() -> ssl.SSLContext:
+    if certifi is not None:
+        return ssl.create_default_context(cafile=certifi.where())
+    return ssl.create_default_context()
+
+
+def _urlopen(request: urllib.request.Request, timeout: float) -> Any:
+    return urllib.request.urlopen(request, timeout=timeout, context=_ssl_context())
+
+
 def _version_tuple(value: str) -> tuple[int, ...]:
     cleaned = value.strip().lower().removeprefix("v")
     parts = cleaned.split(".")
@@ -116,7 +132,7 @@ def parse_update_manifest(data: dict[str, Any]) -> UpdateInfo:
 
 def fetch_update_info(url: str = UPDATE_MANIFEST_URL, timeout: float = 15.0) -> UpdateInfo:
     request = urllib.request.Request(url, headers={"User-Agent": "WindowsFileOrganizer-Updater"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _urlopen(request, timeout) as response:
         data = json.loads(response.read().decode("utf-8-sig"))
     if not isinstance(data, dict):
         raise ValueError("更新清单顶层必须是对象。")
@@ -203,7 +219,7 @@ def download_update(
         downloaded = 0
         total_bytes = None
         _raise_if_cancelled(cancel_event, target)
-        with urllib.request.urlopen(request, timeout=timeout) as response, target.open("wb") as output:
+        with _urlopen(request, timeout) as response, target.open("wb") as output:
             total_bytes = _content_length(response)
             while True:
                 _raise_if_cancelled(cancel_event, target)

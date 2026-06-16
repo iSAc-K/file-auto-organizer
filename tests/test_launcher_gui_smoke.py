@@ -54,8 +54,8 @@ class LauncherGuiSmokeTests(unittest.TestCase):
 
     def test_missing_version_file_uses_250_fallback_in_gui(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(launcher_gui.display_version(Path(tmp)), "2.5.0")
-            self.assertIn("v2.5.0", launcher_gui.APP_TITLE)
+            self.assertEqual(launcher_gui.display_version(Path(tmp)), "2.5.1")
+            self.assertIn("v2.5.1", launcher_gui.APP_TITLE)
 
     def setUp(self) -> None:
         self.saved_gui_state = {

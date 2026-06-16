@@ -13,10 +13,12 @@ from update_manager import (
     UpdateCancelled,
     download_update,
     fetch_update_info_with_retry,
+    fetch_update_info,
     is_newer_version,
     parse_update_manifest,
     verify_sha256,
 )
+import update_manager
 
 
 class FakeResponse:
@@ -26,7 +28,7 @@ class FakeResponse:
         if content_length is not None:
             self.headers["Content-Length"] = content_length
 
-    def read(self, size: int) -> bytes:
+    def read(self, size: int = -1) -> bytes:
         return self.stream.read(size)
 
     def __enter__(self):
@@ -96,6 +98,35 @@ class UpdateManagerTests(unittest.TestCase):
         self.assertEqual(info, UpdateInfo("2.4.0", "https://example.com/app.zip", "a" * 64, ["新增配置页"]))
         with self.assertRaises(ValueError):
             parse_update_manifest({"version": "2.4", "download_url": "http://bad/app.zip", "sha256": "x"})
+
+    def test_urlopen_uses_certifi_ssl_context(self):
+        request = update_manager.urllib.request.Request("https://example.com/update.json")
+        with (
+            patch("update_manager.certifi.where", return_value="C:/certifi/cacert.pem") as where,
+            patch("update_manager.ssl.create_default_context", return_value="context") as create_context,
+            patch("update_manager.urllib.request.urlopen", return_value=FakeResponse(b"{}")) as urlopen,
+        ):
+            response = update_manager._urlopen(request, 7.5)
+
+        self.assertIsInstance(response, FakeResponse)
+        where.assert_called_once_with()
+        create_context.assert_called_once_with(cafile="C:/certifi/cacert.pem")
+        urlopen.assert_called_once_with(request, timeout=7.5, context="context")
+
+    def test_fetch_update_info_uses_shared_urlopen(self):
+        payload = json.dumps(
+            {
+                "version": "2.5.0",
+                "download_url": "https://example.com/app.zip",
+                "sha256": "a" * 64,
+                "notes": [],
+            }
+        ).encode("utf-8")
+        with patch("update_manager._urlopen", return_value=FakeResponse(payload)) as urlopen:
+            info = fetch_update_info("https://example.com/update.json", timeout=3.0)
+
+        self.assertEqual(info.version, "2.5.0")
+        self.assertEqual(urlopen.call_args.args[1], 3.0)
 
     def test_verify_sha256(self):
         with tempfile.TemporaryDirectory() as tmp:
