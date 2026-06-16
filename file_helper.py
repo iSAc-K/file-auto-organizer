@@ -35,6 +35,8 @@ except ImportError:  # PyYAML is recommended, but the default config has a fallb
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 RUN_LOG_NAME = "organizer_run_log.json"
 RUN_LOG_TMP_NAME = "organizer_run_log.json.tmp"
+HISTORY_SCHEMA_VERSION = 1
+MAX_APPLY_RUNS = 100
 REPORT_NAME = "整理报告.xlsx"
 UNDOABLE_RUN_STATUSES = {"success", "partial"}
 WINDOWS_ILLEGAL_CHARS = r'\/:*?"<>|'
@@ -126,6 +128,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 class ConfigError(Exception):
     """Configuration is invalid."""
+
+
+class RunLogWriteError(RuntimeError):
+    """The machine-readable run log could not be safely persisted."""
 
 
 @dataclass
@@ -558,19 +564,93 @@ def load_run_log(run_log_path: Path) -> Dict[str, Any]:
     return data
 
 
+def is_apply_run(run: Any) -> bool:
+    return isinstance(run, dict) and run.get("mode", "apply") == "apply"
+
+
+def prune_apply_runs(data: Dict[str, Any], limit: int = MAX_APPLY_RUNS) -> None:
+    runs = data.get("runs", [])
+    apply_indexes = [index for index, run in enumerate(runs) if is_apply_run(run)]
+    remove_count = max(0, len(apply_indexes) - limit)
+    remove_indexes = set(apply_indexes[:remove_count])
+    data["runs"] = [run for index, run in enumerate(runs) if index not in remove_indexes]
+
+
 def safe_write_run_log(run_log_path: Path, data: Dict[str, Any]) -> None:
-    run_log_path.parent.mkdir(parents=True, exist_ok=True)
+    prune_apply_runs(data)
     tmp_path = run_log_path.with_name(RUN_LOG_TMP_NAME)
-    with tmp_path.open("w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp_path, run_log_path)
+    try:
+        run_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp_path.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, run_log_path)
+    except OSError as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RunLogWriteError(f"无法安全写入运行日志：{exc}") from exc
 
 
-def create_apply_run(root: Path, run_log_path: Path) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def history_result_id(index: int) -> str:
+    return f"result-{index + 1}"
+
+
+def build_history_source_item(item: WorkItem) -> Dict[str, Any]:
+    source_path = item.archive_path if item.source_type == "archive" and item.archive_path else item.current_path
+    return {
+        "original_name": item.original_name,
+        "source_path": absolute_text(source_path),
+        "source_type": item.source_type,
+    }
+
+
+def build_history_snapshot(groups: List[PlanGroup]) -> Dict[str, Any]:
+    results = []
+    for index, group in enumerate(groups):
+        matched_keywords = []
+        for item in group.items:
+            keyword = item.detection.matched_keyword
+            if keyword and keyword not in matched_keywords:
+                matched_keywords.append(keyword)
+        results.append(
+            {
+                "result_id": history_result_id(index),
+                "final_name": group.final_name,
+                "target_path": absolute_text(group.target_path),
+                "source_items": [build_history_source_item(item) for item in group.items],
+                "merged": group.is_merge and len(group.items) > 1,
+                "date": group.date_label,
+                "category": group.category,
+                "orders": group.orders,
+                "quantity": group.quantity,
+                "matched_keywords": matched_keywords,
+                "status": "pending",
+                "error_reason": "",
+            }
+        )
+    return {"schema_version": HISTORY_SCHEMA_VERSION, "results": results}
+
+
+def find_history_result(run: Dict[str, Any], result_id: str) -> Dict[str, Any]:
+    snapshot = run.get("history_snapshot", {})
+    results = snapshot.get("results", []) if isinstance(snapshot, dict) else []
+    for result in results:
+        if isinstance(result, dict) and result.get("result_id") == result_id:
+            return result
+    raise ValueError(f"历史结果不存在：{result_id}")
+
+
+def create_apply_run(
+    root: Path,
+    run_log_path: Path,
+    groups: List[PlanGroup],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     data = load_run_log(run_log_path)
     run = {
         "run_id": run_id_text(),
+        "mode": "apply",
         "root": absolute_text(root),
         "time": now_text(),
         "status": "running",
@@ -578,10 +658,34 @@ def create_apply_run(root: Path, run_log_path: Path) -> Tuple[Dict[str, Any], Di
         "undo_time": "",
         "undo_status": "",
         "operations": [],
+        "history_snapshot": build_history_snapshot(groups),
     }
     data["runs"].append(run)
     safe_write_run_log(run_log_path, data)
     return data, run
+
+
+def update_history_result(
+    run_log_path: Path,
+    data: Dict[str, Any],
+    run: Dict[str, Any],
+    result_id: str,
+    status: str,
+    error_reason: str = "",
+) -> None:
+    set_history_result(run, result_id, status, error_reason)
+    safe_write_run_log(run_log_path, data)
+
+
+def set_history_result(
+    run: Dict[str, Any],
+    result_id: str,
+    status: str,
+    error_reason: str = "",
+) -> None:
+    result = find_history_result(run, result_id)
+    result["status"] = status
+    result["error_reason"] = error_reason
 
 
 def append_run_operation(
@@ -590,8 +694,19 @@ def append_run_operation(
     run: Dict[str, Any],
     operation: Dict[str, Any],
 ) -> None:
-    run.setdefault("operations", []).append(operation)
-    safe_write_run_log(run_log_path, data)
+    operations = run.setdefault("operations", [])
+    previous_status = run.get("status")
+    operations.append(operation)
+    run["status"] = "partial"
+    try:
+        safe_write_run_log(run_log_path, data)
+    except RunLogWriteError:
+        operations.pop()
+        if previous_status is None:
+            run.pop("status", None)
+        else:
+            run["status"] = previous_status
+        raise
 
 
 def update_run_status(run_log_path: Path, data: Dict[str, Any], run: Dict[str, Any], status: str) -> None:
@@ -1754,11 +1869,22 @@ def compress_groups(
             continue
         try:
             add_folder_to_zip(group.target_path, zip_path)
-            append_run_operation(run_log_path, run_log_data, run, make_operation("archive_create", target_after=zip_path))
+            try:
+                append_run_operation(run_log_path, run_log_data, run, make_operation("archive_create", target_after=zip_path))
+            except RunLogWriteError as save_exc:
+                try:
+                    zip_path.unlink()
+                except OSError as rollback_exc:
+                    message = f"{save_exc}；删除未记录 zip 失败：{rollback_exc}"
+                    log_group_zip(log_path, "apply", "zip", group, status="failed", error_message=message)
+                    raise RunLogWriteError(message) from save_exc
+                raise
             log_group_zip(log_path, "apply", "zip", group)
             if compression_status is not None:
                 compression_status[key] = "已压缩"
             print(f"完成压缩：{zip_path.name}")
+        except RunLogWriteError:
+            raise
         except Exception as exc:
             if zip_path.exists():
                 try:
@@ -1782,11 +1908,14 @@ def apply_plan(
 ) -> Tuple[List[PlanGroup], int]:
     completed_groups: List[PlanGroup] = []
     failed_count = 0
-    for group in groups:
+    for index, group in enumerate(groups):
+        result_id = history_result_id(index)
         try:
             if group.target_path.exists():
+                reason = "目标目录已存在，按 conflict.target_exists=skip 跳过。"
                 for item in group.items:
-                    log_item(log_path, "apply", "skip", item, group=group, status="skipped", error_message="目标目录已存在，按 conflict.target_exists=skip 跳过。")
+                    log_item(log_path, "apply", "skip", item, group=group, status="skipped", error_message=reason)
+                update_history_result(run_log_path, run_log_data, run, result_id, "skipped", reason)
                 print(f"跳过：目标目录已存在 -> {group.target_path}")
                 continue
             for item in group.items:
@@ -1794,12 +1923,54 @@ def apply_plan(
                     raise RuntimeError(f"来源准备失败：{item.original_name}")
             if group.is_merge:
                 group.target_path.mkdir(parents=False, exist_ok=False)
-                append_run_operation(run_log_path, run_log_data, run, make_operation("create_dir", target_after=group.target_path))
-                for item in group.items:
+                try:
+                    append_run_operation(run_log_path, run_log_data, run, make_operation("create_dir", target_after=group.target_path))
+                except RunLogWriteError as save_exc:
+                    try:
+                        group.target_path.rmdir()
+                    except OSError as rollback_exc:
+                        message = f"{save_exc}；删除未记录空目录失败：{rollback_exc}"
+                        for item in group.items:
+                            log_item(log_path, "apply", "skip", item, group=group, status="failed", error_message=message)
+                        raise RunLogWriteError(message) from save_exc
+                    raise
+                for item_index, item in enumerate(group.items):
                     destination = next_available_path(group.target_path / item.inner_name)
                     source_before = item.current_path
                     shutil.move(str(item.current_path), str(destination))
-                    append_run_operation(run_log_path, run_log_data, run, make_operation("move", source_before=source_before, target_after=destination))
+                    is_last_operation = item_index == len(group.items) - 1
+                    previous_result = None
+                    if is_last_operation:
+                        result = find_history_result(run, result_id)
+                        previous_result = (result.get("status", ""), result.get("error_reason", ""))
+                        set_history_result(run, result_id, "success")
+                    try:
+                        append_run_operation(
+                            run_log_path,
+                            run_log_data,
+                            run,
+                            make_operation("move", source_before=source_before, target_after=destination),
+                        )
+                    except RunLogWriteError as save_exc:
+                        if previous_result is not None:
+                            set_history_result(run, result_id, previous_result[0], previous_result[1])
+                        try:
+                            shutil.move(str(destination), str(source_before))
+                        except Exception as rollback_exc:
+                            message = f"{save_exc}；回滚移动失败：{rollback_exc}"
+                            log_item(
+                                log_path,
+                                "apply",
+                                "skip",
+                                item,
+                                group=group,
+                                status="failed",
+                                error_message=message,
+                                source_path=destination,
+                                target_path=source_before,
+                            )
+                            raise RunLogWriteError(message) from save_exc
+                        raise
                     log_item(log_path, "apply", "move", item, group=group, source_path=source_before, target_path=destination)
                     log_item(log_path, "apply", "merge", item, group=group, source_path=destination, target_path=group.target_path)
                 print(f"完成合并：{group.final_name}")
@@ -1810,18 +1981,51 @@ def apply_plan(
                     log_item(log_path, "apply", "rename", item, group=group, status="skipped", error_message="来源名称已经等于目标名称。")
                     print(f"跳过重命名：{item.current_path.name}")
                     completed_groups.append(group)
+                    update_history_result(run_log_path, run_log_data, run, result_id, "success")
                     continue
                 source_before = item.current_path
                 item.current_path.rename(group.target_path)
-                append_run_operation(run_log_path, run_log_data, run, make_operation("move", source_before=source_before, target_after=group.target_path))
+                result = find_history_result(run, result_id)
+                previous_result = (result.get("status", ""), result.get("error_reason", ""))
+                set_history_result(run, result_id, "success")
+                try:
+                    append_run_operation(
+                        run_log_path,
+                        run_log_data,
+                        run,
+                        make_operation("move", source_before=source_before, target_after=group.target_path),
+                    )
+                except RunLogWriteError as save_exc:
+                    set_history_result(run, result_id, previous_result[0], previous_result[1])
+                    try:
+                        shutil.move(str(group.target_path), str(source_before))
+                    except Exception as rollback_exc:
+                        message = f"{save_exc}；回滚移动失败：{rollback_exc}"
+                        log_item(
+                            log_path,
+                            "apply",
+                            "skip",
+                            item,
+                            group=group,
+                            status="failed",
+                            error_message=message,
+                            source_path=group.target_path,
+                            target_path=source_before,
+                        )
+                        raise RunLogWriteError(message) from save_exc
+                    raise
                 log_item(log_path, "apply", "rename", item, group=group, source_path=source_before, target_path=group.target_path)
                 print(f"完成重命名：{item.original_name} -> {group.final_name}")
                 completed_groups.append(group)
+        except RunLogWriteError:
+            raise
         except Exception as exc:
             failed_count += 1
+            reason = str(exc)
             for item in group.items:
-                log_item(log_path, "apply", "skip", item, group=group, status="failed", error_message=str(exc))
-            print(f"错误：{group.final_name} 执行失败，已跳过。原因：{exc}")
+                log_item(log_path, "apply", "skip", item, group=group, status="failed", error_message=reason)
+            update_history_result(run_log_path, run_log_data, run, result_id, "failed", reason)
+            print(f"错误：{group.final_name} 执行失败，已跳过。原因：{reason}")
     return completed_groups, failed_count
 
 
@@ -1829,6 +2033,8 @@ def find_last_undoable_run(data: Dict[str, Any], root: Path) -> Optional[Dict[st
     root_text = absolute_text(root)
     for run in reversed(data.get("runs", [])):
         if not isinstance(run, dict):
+            continue
+        if run.get("mode", "apply") != "apply":
             continue
         if run.get("root") != root_text:
             continue
@@ -1986,7 +2192,13 @@ def undo_last(root: Path, log_path: Path, run_log_path: Path, confirmed: bool = 
         undo_status = "partial"
     else:
         undo_status = "failed"
-    update_run_undo_status(run_log_path, data, run, True, undo_status)
+    try:
+        update_run_undo_status(run_log_path, data, run, True, undo_status)
+    except RunLogWriteError as exc:
+        message = f"无法保存 undo 最终状态：{exc}"
+        log_undo(log_path, "undo_error", status="failed", error_message=message)
+        print(f"错误：{message}")
+        return 1
     print(f"undo-last 完成，状态：{undo_status}。日志已写入：{log_path}")
     return 0
 
@@ -2067,7 +2279,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         log_confirmation(log_path, "apply", "cli_yes")
     try:
-        run_log_data, run = create_apply_run(root, run_log_path)
+        run_log_data, run = create_apply_run(root, run_log_path, groups)
     except Exception as exc:
         write_log(log_path, {"time": now_text(), "mode": "apply", "action": "skip", "status": "failed", "error_message": f"无法创建 organizer_run_log.json：{exc}"})
         print(f"错误：无法创建 organizer_run_log.json：{exc}")
@@ -2076,10 +2288,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for item in items:
         if item.skip_reason:
             log_item(log_path, "apply", "skip", item, status="skipped", error_message=item.skip_reason)
-    completed_groups, failed_count = apply_plan(groups, log_path, run_log_path, run_log_data, run)
-    compression_status: Dict[str, str] = {}
-    if args.archive:
-        failed_count += compress_groups(completed_groups, log_path, run_log_path, run_log_data, run, compression_status)
+    try:
+        completed_groups, failed_count = apply_plan(groups, log_path, run_log_path, run_log_data, run)
+        compression_status: Dict[str, str] = {}
+        if args.archive:
+            failed_count += compress_groups(
+                completed_groups,
+                log_path,
+                run_log_path,
+                run_log_data,
+                run,
+                compression_status,
+            )
+    except RunLogWriteError as exc:
+        write_log(
+            log_path,
+            {
+                "time": now_text(),
+                "mode": "apply",
+                "action": "skip",
+                "status": "failed",
+                "error_message": str(exc),
+            },
+        )
+        print(f"错误：{exc}")
+        print("已停止后续整理，避免产生无法记录撤销信息的操作。")
+        return 1
     safe_write_organize_report(
         root,
         items,
@@ -2098,7 +2332,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         run_status = "partial"
     else:
         run_status = "success"
-    update_run_status(run_log_path, run_log_data, run, run_status)
+    try:
+        update_run_status(run_log_path, run_log_data, run, run_status)
+    except RunLogWriteError as exc:
+        write_log(
+            log_path,
+            {
+                "time": now_text(),
+                "mode": "apply",
+                "action": "skip",
+                "status": "failed",
+                "error_message": str(exc),
+            },
+        )
+        print(f"错误：{exc}")
+        print("无法保存 apply 最终状态。")
+        return 1
     print(f"apply 完成，状态：{run_status}。日志已写入：{log_path}")
     print(f"可撤销操作日志已写入：{run_log_path}")
     return 0

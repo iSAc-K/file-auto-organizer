@@ -25,6 +25,7 @@ UpdateStatus = Literal[
     "updater_started",
 ]
 VALID_MODES: set[str] = {"dry-run", "apply", "undo-last"}
+VALID_HISTORY_MODES: set[str] = {"apply", "dry-run", "undo-last"}
 PREVIEW_COLUMN_WIDTHS = {
     "序号": 48,
     "原文件夹": 210,
@@ -40,6 +41,22 @@ PREVIEW_COLUMN_WIDTHS = {
 }
 PREVIEW_COLUMN_MAX_WIDTH = 600
 PREVIEW_COLUMN_PADDING = 24
+RUN_STATUS_TEXT = {
+    "success": "成功",
+    "partial": "部分成功",
+    "failed": "失败",
+    "running": "执行中断",
+}
+RESULT_STATUS_TEXT = {
+    "success": "成功",
+    "skipped": "跳过",
+    "failed": "失败",
+    "pending": "执行中断",
+}
+VALID_RUN_STATUSES = frozenset(RUN_STATUS_TEXT)
+VALID_RESULT_STATUSES = frozenset(RESULT_STATUS_TEXT)
+EMPTY_HISTORY_TEXT = "暂无执行历史，完成一次执行整理后会显示在这里"
+LEGACY_HISTORY_TEXT = "旧版记录，详情不完整"
 
 
 class OperationGate:
@@ -114,6 +131,47 @@ class UpdateProgressText:
     percent: str
     value: float
     indeterminate: bool
+
+
+@dataclass(frozen=True)
+class HistorySourceItem:
+    original_name: str
+    source_type: str
+    source_path: str
+
+
+@dataclass(frozen=True)
+class HistoryResult:
+    result_id: str
+    final_name: str
+    target_path: str
+    source_items: tuple[HistorySourceItem, ...]
+    merged: bool
+    date: str
+    category: str
+    orders: int
+    quantity: int
+    matched_keywords: tuple[str, ...]
+    status: str
+    status_text: str
+    error_reason: str
+
+
+@dataclass(frozen=True)
+class HistoryRun:
+    run_id: str
+    time: str
+    root: str
+    status: str
+    status_text: str
+    has_complete_details: bool
+    results: tuple[HistoryResult, ...]
+
+
+@dataclass(frozen=True)
+class ApplyHistoryState:
+    runs: tuple[HistoryRun, ...]
+    error: str = ""
 
 
 def app_base_dir() -> Path:
@@ -420,6 +478,140 @@ def undo_log_status(root_path: str | Path) -> tuple[bool, str]:
     if not isinstance(runs, list) or not runs:
         return False, "organizer_run_log.json 中没有可检查的运行记录。"
     return True, f"已找到 organizer_run_log.json，共 {len(runs)} 条运行记录。"
+
+
+def _history_object(value: object, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必须是对象。")
+    return value
+
+
+def _history_text(data: dict[str, Any], field: str) -> str:
+    if field not in data or type(data[field]) is not str:
+        raise ValueError(f"{field} 必须是字符串。")
+    return data[field]
+
+
+def _history_int(data: dict[str, Any], field: str) -> int:
+    if field not in data or type(data[field]) is not int:
+        raise ValueError(f"{field} 必须是整数。")
+    return data[field]
+
+
+def _history_bool(data: dict[str, Any], field: str) -> bool:
+    if field not in data or type(data[field]) is not bool:
+        raise ValueError(f"{field} 必须是布尔值。")
+    return data[field]
+
+
+def _history_status_text(status: str, mapping: dict[str, str]) -> str:
+    return mapping.get(status, status or "未知")
+
+
+def _validate_history_run_fields(run: dict[str, Any]) -> None:
+    for field in ("run_id", "time", "root", "status"):
+        _history_text(run, field)
+
+
+def parse_history_source_item(value: object) -> HistorySourceItem:
+    item = _history_object(value, "source_item")
+    return HistorySourceItem(
+        original_name=_history_text(item, "original_name"),
+        source_type=_history_text(item, "source_type"),
+        source_path=_history_text(item, "source_path"),
+    )
+
+
+def parse_history_result(value: object) -> HistoryResult:
+    result = _history_object(value, "result")
+    source_items = result.get("source_items")
+    if not isinstance(source_items, list):
+        raise ValueError("source_items 必须是列表。")
+    matched_keywords = result.get("matched_keywords")
+    if not isinstance(matched_keywords, list):
+        raise ValueError("matched_keywords 必须是列表。")
+    parsed_keywords = []
+    for keyword in matched_keywords:
+        if type(keyword) is not str:
+            raise ValueError("matched_keywords 每项必须是字符串。")
+        parsed_keywords.append(keyword)
+    status = _history_text(result, "status")
+    if status not in VALID_RESULT_STATUSES:
+        raise ValueError(f"result.status 不受支持：{status}")
+    return HistoryResult(
+        result_id=_history_text(result, "result_id"),
+        final_name=_history_text(result, "final_name"),
+        target_path=_history_text(result, "target_path"),
+        source_items=tuple(parse_history_source_item(item) for item in source_items),
+        merged=_history_bool(result, "merged"),
+        date=_history_text(result, "date"),
+        category=_history_text(result, "category"),
+        orders=_history_int(result, "orders"),
+        quantity=_history_int(result, "quantity"),
+        matched_keywords=tuple(parsed_keywords),
+        status=status,
+        status_text=_history_status_text(status, RESULT_STATUS_TEXT),
+        error_reason=_history_text(result, "error_reason"),
+    )
+
+
+def parse_history_run(value: object) -> HistoryRun:
+    run = _history_object(value, "run")
+    _validate_history_run_fields(run)
+    status = _history_text(run, "status")
+    if status not in VALID_RUN_STATUSES:
+        raise ValueError(f"run.status 不受支持：{status}")
+    snapshot = run.get("history_snapshot")
+    has_complete_details = False
+    results: tuple[HistoryResult, ...] = ()
+    schema_version = snapshot.get("schema_version") if isinstance(snapshot, dict) else None
+    if type(schema_version) is int and schema_version == 1:
+        raw_results = snapshot.get("results")
+        if not isinstance(raw_results, list):
+            raise ValueError("history_snapshot.results 必须是列表。")
+        results = tuple(parse_history_result(result) for result in raw_results)
+        has_complete_details = True
+    return HistoryRun(
+        run_id=_history_text(run, "run_id"),
+        time=_history_text(run, "time"),
+        root=_history_text(run, "root"),
+        status=status,
+        status_text=_history_status_text(status, RUN_STATUS_TEXT),
+        has_complete_details=has_complete_details,
+        results=results,
+    )
+
+
+def load_apply_history(root_path: str | Path) -> ApplyHistoryState:
+    run_log_path = Path(root_path).expanduser().resolve() / "organizer_run_log.json"
+    if not run_log_path.exists():
+        return ApplyHistoryState(runs=())
+    try:
+        with run_log_path.open("r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("organizer_run_log.json 顶层必须是对象。")
+        raw_runs = data.get("runs")
+        if not isinstance(raw_runs, list):
+            raise ValueError("organizer_run_log.json 中 runs 必须是列表。")
+        parsed_runs = []
+        for raw_run in reversed(raw_runs):
+            run = _history_object(raw_run, "run")
+            _validate_history_run_fields(run)
+            mode = run.get("mode", "apply")
+            if type(mode) is not str:
+                raise ValueError("mode 必须是字符串。")
+            if mode not in VALID_HISTORY_MODES:
+                raise ValueError(f"mode 不受支持：{mode}")
+            if mode == "apply":
+                parsed_runs.append(parse_history_run(run))
+        runs = tuple(parsed_runs)
+        return ApplyHistoryState(runs=runs)
+    except Exception as exc:
+        return ApplyHistoryState(
+            runs=(),
+            error=f"organizer_run_log.json 无法读取：{run_log_path}：{exc}",
+        )
 
 
 def read_version(base_dir: str | Path | None = None) -> str:

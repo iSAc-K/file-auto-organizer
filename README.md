@@ -265,6 +265,8 @@ rename_log.csv
 organizer_run_log.json
 ```
 
+`organizer_run_log.json` 的保留数量、执行历史显示和撤销边界详见“v2.5 执行历史”章节；`rename_log.csv` 不裁剪。
+
 这些运行产物不会提交到 GitHub。仓库里只保留 `rename_log.example.csv` 作为表头示例。
 
 预览模式的日志动作都以 `plan_` 开头，例如 `plan_extract`、`plan_scan`、`plan_merge`、`plan_rename`、`plan_skip`。执行模式阶段才会使用真实动作名称，例如 `extract`、`move`、`merge`、`rename`、`zip`、`skip`。撤销会写入 `plan_undo`、`undo_move`、`undo_remove_empty_dir`、`undo_skip`、`undo_error`。
@@ -303,7 +305,7 @@ dry-run 报告显示计划结果，apply 报告显示实际结果。报告字段
 如果源码里的 `file_helper.py`、`config_manager.py`、`config.default.yaml`、`README.md` 或 `VERSION.txt` 改过，但发布文件夹没有同步，EXE 旁边的外置脚本和配置可能仍是旧版本。发布前可以运行检查命令：
 
 ```powershell
-python tools/check_release_sync.py --release ".\Windows文件整理助手-v1.2"
+python tools/check_release_sync.py --release ".\Windows文件整理助手-v当前版本"
 ```
 
 这个命令只检查，不会复制、覆盖或修改发布文件夹。检查结果会显示每个文件是 `一致`、`缺失` 或 `不一致`。全部一致时返回码为 `0`；只要有缺失或不一致，返回码为 `1`。
@@ -385,9 +387,22 @@ v2.3 的图形启动器仍然只是启动器和预览界面，不重写 `file_he
 - `撤销上次整理`：确认后才启动 `--undo-last --yes`。
 - 主操作栏固定在窗口底部，只有中间内容区域滚动。
 
+## v2.5 执行历史
+
+GUI 左侧新增只读的“执行历史”入口，只显示当前所选 root 的 apply 记录，不显示 dry-run 或 undo 记录。
+
+- 左侧列表按日志中的记录顺序从新到旧排列，并显示执行时间、root 和状态。
+- 右侧按最终结果文件夹显示目标、来源数、是否合并、日期、品类、单量、数量和命中关键词。
+- 展开结果可以查看来源，以及失败或跳过原因。
+- 旧版本生成的记录如果缺少新增字段，GUI 会提示“详情不完整”，不会补猜缺失内容。
+- 状态仍为 `running` 的记录会显示“执行中断”；GUI 只展示日志中已经写入的内容，不根据当前磁盘状态猜测执行结果。
+- 执行历史不提供搜索、删除、路径打开或从历史记录发起撤销。撤销仍只通过“撤销上次”处理最近一次可撤销的 apply。
+
+`organizer_run_log.json` 最多保留最近 100 次 apply。写入第 101 次 apply 时，会按日志中的记录顺序删除最旧位置的一整条 apply 记录，包括 `operations` 和历史详情，不依据 `time` 字段重新排序。此规则处理所有状态，包括 `running`、`failed`、`partial` 和 `success`，不只删除已完成或成功记录。被删除的记录不再显示在执行历史中，也不能再通过 `--undo-last` 撤销。`rename_log.csv` 不裁剪，继续保留完整的人类审计记录。
+
 ## Windows exe 使用方式
 
-1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v2.4`。
+1. 解压或打开实际发布文件夹，例如 `Windows文件整理助手-v当前版本`。
 2. 双击 `Windows文件整理助手.exe`。
 3. `file_helper.py 路径` 默认会自动指向 exe 同目录下的 `file_helper.py`。
 4. 配置路径默认会自动指向 exe 同目录下的 `config.default.yaml`。
@@ -396,15 +411,16 @@ v2.3 的图形启动器仍然只是启动器和预览界面，不重写 `file_he
 7. 确认 dry-run 结果无误后，再切换到 `执行整理（--apply）` 运行。
 8. 执行整理点击运行时会先弹窗确认；确认后启动器会通过一次性 `--yes` 执行。
 9. `撤销上次（--undo-last）` 可以撤销最近一次 apply，并同样会先弹窗确认后通过一次性 `--yes` 执行。
-10. `organizer_run_log.json` 和 `rename_log.csv` 会生成在 root 目录中。
-11. 用户品类与关键词通过“配置管理”保存到 `user_config.yaml`。
-12. 不要删除 `file_helper.py`、`config_manager.py` 和 `config.default.yaml`，否则 exe 无法正常调用核心整理脚本和配置。
+10. 左侧 `执行历史` 是当前所选 root 的只读 apply 记录入口，详见“v2.5 执行历史”章节。
+11. `organizer_run_log.json` 和 `rename_log.csv` 会生成在 root 目录中。
+12. 用户品类与关键词通过“配置管理”保存到 `user_config.yaml`。
+13. 不要删除 `file_helper.py`、`config_manager.py` 和 `config.default.yaml`，否则 exe 无法正常调用核心整理脚本和配置。
 
 ## 图形启动器 launcher_gui.py
 
 `launcher_gui.py` 是一个独立的 Windows 图形启动器，只负责选择路径、生成命令、复制命令，并通过隐藏的后台 PowerShell 调用 `file_helper.py`。它不包含文件整理、分类、合并、重命名或压缩的核心逻辑。
 
-新版启动器使用现代化 CustomTkinter 界面：左侧是模式导航，右侧是整理任务工作区。左侧用于切换 `预览模式`、`执行整理`、`撤销上次`，右侧用于填写 Python 命令、脚本路径、root 路径、config 路径，以及查看命令预览和运行状态。
+新版启动器使用现代化 CustomTkinter 界面：左侧是模式导航和只读的 `执行历史` 入口，右侧是整理任务工作区或历史详情。执行历史的显示范围和只读边界详见“v2.5 执行历史”章节。
 
 运行启动器：
 
@@ -421,6 +437,7 @@ py launcher_gui.py
 - `预览模式` 对应 `--dry-run`，默认选中，只生成和执行预览命令，不做真实修改。
 - `执行整理` 对应 `--apply`，会执行真实整理；点击运行时会先弹出确认框，确认后启动器才自动追加一次性 `--yes`，PowerShell 不再等待输入大写 `YES`。
 - `撤销上次` 对应 `--undo-last`，会生成撤销命令，不使用 `config.yaml`，不带 `--config`、`--dry-run`、`--apply` 或 `--archive`，并会禁用压缩选项。
+- `执行历史` 是当前所选 root 的只读 apply 记录入口，详见“v2.5 执行历史”章节。
 - `整理完成后压缩最终文件夹` 只会在执行模式中追加 `--archive`。
 - `处理完成后打开结果目录` 会在脚本正常退出后用 PowerShell `Start-Process` 打开 root；脚本失败时不会自动打开。
 - 点击 `生成命令` 可以在预览框查看普通 PowerShell 命令；普通命令预览永远不带 `--yes`。
